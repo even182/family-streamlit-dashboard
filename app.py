@@ -8,6 +8,30 @@ st.set_page_config(page_title="Family Portfolio Dashboard", layout="wide")
 DATA_DIR = Path(__file__).parent / "data"
 XLSX_PATH = DATA_DIR / "family_data.xlsx"
 
+# ====== 管理者驗證（用 Streamlit Secrets：ADMIN_PASSWORD）======
+def is_admin() -> bool:
+    """只有輸入正確管理者密碼才回傳 True。
+    登入狀態會存在 session_state，同一個瀏覽器 session 不用一直重打。
+    """
+    if st.session_state.get("is_admin", False):
+        return True
+
+    # 沒設定 Secrets 就直接關閉管理者功能（安全預設）
+    admin_pw = st.secrets.get("ADMIN_PASSWORD", "Xeng4351..")
+    if not admin_pw:
+        return False
+
+    with st.sidebar.expander("管理者登入", expanded=False):
+        pw = st.text_input("管理者密碼", type="password", key="admin_pw_input")
+        if st.button("登入", key="admin_login_btn"):
+            if pw == admin_pw:
+                st.session_state["is_admin"] = True
+                st.success("已進入管理者模式")
+                st.rerun()
+            else:
+                st.error("密碼錯誤")
+    return False
+
 # ====== 小工具：把文字數字清乾淨 ======
 def to_num(s: pd.Series) -> pd.Series:
     return pd.to_numeric(
@@ -26,7 +50,6 @@ def load_data(xlsx_path: Path):
     return richard, acct
 
 def compute_kpi(richard: pd.DataFrame):
-    # 依你的檔案欄位（你畫面上已用過這些）
     invested_col = "成交金額"
     realized_col = "已實現損益"
     unrealized_col = "未實現損益"
@@ -79,7 +102,6 @@ def make_allocation_pie(richard: pd.DataFrame):
     return fig
 
 def make_timeseries(acct: pd.DataFrame):
-    # 先用帳戶紀錄做曲線最穩（你檔案通常有：日期、結餘、台幣本金、美金本金）
     date_col = "日期" if "日期" in acct.columns else acct.columns[0]
     candidates = ["結餘", "台幣本金", "美金本金"]
     value_col = next((c for c in candidates if c in acct.columns), None)
@@ -95,23 +117,22 @@ def make_timeseries(acct: pd.DataFrame):
     fig.update_layout(height=450)
     return fig
 
-# ====== 側邊欄：你專用上傳（可關） ======
+# ====== 側邊欄：管理者上傳（只有輸入密碼才會出現） ======
 st.sidebar.title("設定")
-admin_mode = st.sidebar.toggle("管理者模式（上傳 Excel）", value=False)
-
-if admin_mode:
-    st.sidebar.info("上傳後會覆蓋 data/family_data.xlsx（只有你做這件事）")
+if is_admin():
+    st.sidebar.markdown("### 管理者操作")
+    st.sidebar.info("上傳後會覆蓋 data/family_data.xlsx（只有你能做這件事）")
     uploaded = st.sidebar.file_uploader("上傳新版 Excel (.xlsx)", type=["xlsx"])
     if uploaded is not None:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         XLSX_PATH.write_bytes(uploaded.getbuffer())
-        st.sidebar.success("已更新 Excel！請按上方『Rerun』或重新整理頁面。")
+        st.sidebar.success("已更新 Excel！請重新整理頁面。")
         st.cache_data.clear()
 
 st.title("家庭投資儀表板（只讀）")
 
 if not XLSX_PATH.exists():
-    st.error("找不到 data/family_data.xlsx。請先把你的 Excel 放進 data/，或開啟管理者模式上傳。")
+    st.error("找不到 data/family_data.xlsx。請由管理者登入後上傳 Excel。")
     st.stop()
 
 richard, acct = load_data(XLSX_PATH)
