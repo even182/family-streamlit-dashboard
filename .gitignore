@@ -1,0 +1,9 @@
+# Excel 資料（不要上 GitHub）
+data/*.xlsx
+
+# Python 雜項
+__pycache__/
+*.pyc
+
+# 虛擬環境（如果之後用到）
+.venv/
