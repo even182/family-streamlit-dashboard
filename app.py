@@ -164,43 +164,72 @@ def make_rank_chart_by_market(richard: pd.DataFrame, market: str, top_n: int = 1
 
 def extract_allocation_from_analysis_block(richard: pd.DataFrame):
     """
-    依你附圖的『分析』區塊抓資產配置：
-    - 找到含『分類』、『參考現值』（若沒有參考現值就用『成交金額』）的那一列當表頭
-    - 讀到『總計』那列為止
+    依你附圖的『分析』區塊抓資產配置（更貼近你的版型）：
+    - 先找到含『分析』字樣的列（就算是合併儲存格也可）
+    - 在該列附近分別找出『分類』欄與『參考現值』（若沒有則用『成交金額』）欄
+    - 從分類資料列一路讀到『總計』為止
     - 回傳 DataFrame: 分類 / 金額
     """
     arr = richard.to_numpy(dtype=object)
     nrows, ncols = arr.shape
 
-    def find_header_row():
+    def row_has(token: str, r: int) -> bool:
+        for c in range(ncols):
+            if _clean_text(arr[r, c]) == token:
+                return True
+        return False
+
+    def find_first_row(token: str):
         for r in range(nrows):
-            row_text = [_clean_text(arr[r, c]) for c in range(ncols)]
-            if "分類" in row_text and ("參考現值" in row_text or "成交金額" in row_text):
-                return r, row_text
+            for c in range(ncols):
+                if _clean_text(arr[r, c]) == token:
+                    return r
+        return None
+
+    def find_token_near(token: str, r0: int, r1: int):
+        for r in range(max(0, r0), min(nrows, r1 + 1)):
+            for c in range(ncols):
+                if _clean_text(arr[r, c]) == token:
+                    return r, c
         return None, None
 
-    header_r, header_row = find_header_row()
-    if header_r is None:
+    # 1) 找『分析』作為區塊錨點
+    anchor_r = find_first_row("分析")
+    if anchor_r is None:
         return None
 
-    # 定位欄位索引
-    cat_idx = header_row.index("分類") if "分類" in header_row else None
-    val_key = "參考現值" if "參考現值" in header_row else "成交金額"
-    val_idx = header_row.index(val_key) if val_key in header_row else None
-
-    if cat_idx is None or val_idx is None:
+    # 2) 在錨點附近找『分類』欄位置
+    cat_r, cat_c = find_token_near("分類", anchor_r - 3, anchor_r + 10)
+    if cat_r is None:
         return None
+
+    # 3) 在錨點附近找『參考現值』（或『成交金額』）欄位置
+    val_r, val_c = find_token_near("參考現值", anchor_r - 3, anchor_r + 10)
+    val_key = "參考現值"
+    if val_r is None:
+        val_r, val_c = find_token_near("成交金額", anchor_r - 3, anchor_r + 10)
+        val_key = "成交金額"
+    if val_r is None:
+        return None
+
+    # 4) 找分類資料起始列：分類表頭下一列往下找第一個非空分類
+    start_r = cat_r + 1
+    while start_r < nrows:
+        cat = _clean_text(arr[start_r, cat_c])
+        if cat and cat not in ["分類"]:
+            break
+        start_r += 1
 
     items = []
-    for r in range(header_r + 1, nrows):
-        cat = _clean_text(arr[r, cat_idx])
+    for r in range(start_r, nrows):
+        cat = _clean_text(arr[r, cat_c])
         if not cat:
             continue
         if cat == "總計":
             break
 
-        val_raw = arr[r, val_idx]
-        val = pd.to_numeric(str(val_raw).replace(",", "").strip(), errors="coerce")
+        raw = arr[r, val_c]
+        val = pd.to_numeric(str(raw).replace(",", "").strip(), errors="coerce")
         if pd.isna(val) or val == 0:
             continue
 
