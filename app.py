@@ -87,15 +87,37 @@ def make_rank_chart(richard: pd.DataFrame):
     return fig
 
 def make_allocation_pie(richard: pd.DataFrame):
+    # 若缺少必要欄位，直接回 None（原本行為）
     if "分類" not in richard.columns or "成交金額" not in richard.columns:
         return None
+
     df = richard.copy()
+
+    # 清理成交金額，將非數字轉為 0
     df["成交金額"] = to_num(df["成交金額"])
-    alloc = (df.groupby("分類")["成交金額"]
-               .sum()
-               .sort_values(ascending=False)
-               .reset_index()
-               .rename(columns={"成交金額": "金額"}))
+
+    # 清理分類：去除前後空白、把空字串轉為 NaN，再去掉 NaN
+    df["分類"] = df["分類"].astype(str).str.strip().replace({"": None, "nan": None})
+    df = df[df["分類"].notna()]
+
+    # 若沒有任何分類值，回 None
+    if df.shape[0] == 0:
+        return None
+
+    # 只聚合有分類且成交金額 != 0 的列（避免 0 金額佔比）
+    alloc = (
+        df[df["成交金額"] != 0]
+        .groupby("分類")["成交金額"]
+        .sum()
+        .sort_values(ascending=False)
+        .reset_index()
+        .rename(columns={"成交金額": "金額"})
+    )
+
+    # 如果聚合後沒有資料，回 None
+    if alloc.shape[0] == 0:
+        return None
+
     fig = px.pie(alloc, names="分類", values="金額", title="資金配置：分類")
     fig.update_traces(textposition="inside", textinfo="percent+label")
     fig.update_layout(height=450)
