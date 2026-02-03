@@ -1,8 +1,8 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 from pathlib import Path
-import numpy as np
 
 st.set_page_config(page_title="Family Portfolio Dashboard", layout="wide")
 
@@ -43,28 +43,6 @@ def to_num(s: pd.Series) -> pd.Series:
         errors="coerce"
     ).fillna(0.0)
 
-def _clean_text(x) -> str:
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return ""
-    return str(x).strip()
-
-def _infer_market_from_code_or_name(code: str, name: str) -> str:
-    code = _clean_text(code)
-    name = _clean_text(name)
-
-    # Prefer code: digits => TW
-    if code:
-        if code.isdigit():
-            return "台股"
-        # Some US tickers might include dots, hyphens; treat as US if contains letters
-        if any(ch.isalpha() for ch in code):
-            return "美股"
-
-    # Fallback to name heuristic
-    if any(ch.isalpha() for ch in name):
-        return "美股"
-    return "台股"
-
 @st.cache_data(show_spinner=False)
 def load_data(xlsx_path: Path):
     xls = pd.ExcelFile(xlsx_path)
@@ -89,166 +67,128 @@ def compute_kpi(richard: pd.DataFrame):
 
     return total_invested, total_realized, total_unrealized, total_pnl, ret
 
-def _filter_trade_like_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """避免把底部『分析/總計』之類的區塊一起算進股票排行。"""
-    d = df.copy()
-
-    code_col = "股票代號" if "股票代號" in d.columns else None
-    name_col = "股票名稱" if "股票名稱" in d.columns else ("股票" if "股票" in d.columns else None)
-
-    if code_col:
-        code = d[code_col].astype(str).str.strip()
-        mask = code.notna() & (code != "") & (code.str.lower() != "nan")
-        # 排除一些明顯不是股票列的字樣
-        mask &= ~code.isin(["分類", "總計", "分析"])
-        d = d[mask]
-    elif name_col:
-        name = d[name_col].astype(str).str.strip()
-        mask = name.notna() & (name != "") & (name.str.lower() != "nan")
-        mask &= ~name.isin(["分類", "總計", "分析"])
-        d = d[mask]
-
-    return d
-
-def make_rank_chart_by_market(richard: pd.DataFrame, market: str, top_n: int = 10):
-    """
-    1) Top N
-    2) 依台股/美股分開
-    """
+def make_rank_chart(richard: pd.DataFrame):
+    name_col = "股票名稱" if "股票名稱" in richard.columns else "股票代號"
     realized_col = "已實現損益"
     unrealized_col = "未實現損益"
 
-    df = _filter_trade_like_rows(richard)
-
-    code_col = "股票代號" if "股票代號" in df.columns else None
-    name_col = "股票名稱" if "股票名稱" in df.columns else ("股票" if "股票" in df.columns else None)
-    if name_col is None:
-        return None
-
-    # 計算總損益
+    df = richard.copy()
     df["已實現損益"] = to_num(df[realized_col]) if realized_col in df.columns else 0.0
     df["未實現損益"] = to_num(df[unrealized_col]) if unrealized_col in df.columns else 0.0
     df["總損益"] = df["已實現損益"] + df["未實現損益"]
 
-    # 推斷市場
-    df["_market"] = [
-        _infer_market_from_code_or_name(
-            df.iloc[i][code_col] if code_col else "",
-            df.iloc[i][name_col] if name_col else ""
-        )
-        for i in range(len(df))
-    ]
+    agg = (df.groupby(name_col, dropna=True)["總損益"]
+             .sum()
+             .sort_values(ascending=False)
+             .reset_index()
+             .rename(columns={name_col: "股票", "總損益": "總損益"}))
 
-    df_m = df[df["_market"] == market].copy()
-    if df_m.empty:
-        return None
-
-    agg = (
-        df_m.groupby(name_col, dropna=True)["總損益"]
-        .sum()
-        .sort_values(ascending=False)
-        .head(top_n)
-        .reset_index()
-        .rename(columns={name_col: "股票", "總損益": "總損益"})
-    )
-
-    fig = px.bar(
-        agg,
-        x="總損益",
-        y="股票",
-        orientation="h",
-        title=f"{market} 股票別總損益 Top {top_n}"
-    )
-    fig.update_layout(height=520, yaxis={"categoryorder": "total ascending"})
+    fig = px.bar(agg.head(30), x="總損益", y="股票", orientation="h", title="股票別總損益 Top 30")
+    fig.update_layout(height=700, yaxis={"categoryorder": "total ascending"})
     return fig
 
-def extract_allocation_from_analysis_block(richard: pd.DataFrame):
-    """
-    依你附圖的『分析』區塊抓資產配置（更貼近你的版型）：
-    - 先找到含『分析』字樣的列（就算是合併儲存格也可）
-    - 在該列附近分別找出『分類』欄與『參考現值』（若沒有則用『成交金額』）欄
-    - 從分類資料列一路讀到『總計』為止
-    - 回傳 DataFrame: 分類 / 金額
-    """
-    arr = richard.to_numpy(dtype=object)
-    nrows, ncols = arr.shape
-
-    def row_has(token: str, r: int) -> bool:
-        for c in range(ncols):
-            if _clean_text(arr[r, c]) == token:
-                return True
-        return False
-
-    def find_first_row(token: str):
-        for r in range(nrows):
-            for c in range(ncols):
-                if _clean_text(arr[r, c]) == token:
-                    return r
+def make_allocation_pie(richard: pd.DataFrame):
+    if "分類" not in richard.columns or "成交金額" not in richard.columns:
         return None
-
-    def find_token_near(token: str, r0: int, r1: int):
-        for r in range(max(0, r0), min(nrows, r1 + 1)):
-            for c in range(ncols):
-                if _clean_text(arr[r, c]) == token:
-                    return r, c
-        return None, None
-
-    # 1) 找『分析』作為區塊錨點
-    anchor_r = find_first_row("分析")
-    if anchor_r is None:
-        return None
-
-    # 2) 在錨點附近找『分類』欄位置
-    cat_r, cat_c = find_token_near("分類", anchor_r - 3, anchor_r + 10)
-    if cat_r is None:
-        return None
-
-    # 3) 在錨點附近找『參考現值』（或『成交金額』）欄位置
-    val_r, val_c = find_token_near("參考現值", anchor_r - 3, anchor_r + 10)
-    val_key = "參考現值"
-    if val_r is None:
-        val_r, val_c = find_token_near("成交金額", anchor_r - 3, anchor_r + 10)
-        val_key = "成交金額"
-    if val_r is None:
-        return None
-
-    # 4) 找分類資料起始列：分類表頭下一列往下找第一個非空分類
-    start_r = cat_r + 1
-    while start_r < nrows:
-        cat = _clean_text(arr[start_r, cat_c])
-        if cat and cat not in ["分類"]:
-            break
-        start_r += 1
-
-    items = []
-    for r in range(start_r, nrows):
-        cat = _clean_text(arr[r, cat_c])
-        if not cat:
-            continue
-        if cat == "總計":
-            break
-
-        raw = arr[r, val_c]
-        val = pd.to_numeric(str(raw).replace(",", "").strip(), errors="coerce")
-        if pd.isna(val) or val == 0:
-            continue
-
-        items.append({"分類": cat, "金額": float(val)})
-
-    if not items:
-        return None
-
-    return pd.DataFrame(items)
-
-def make_allocation_pie_from_analysis(richard: pd.DataFrame):
-    alloc = extract_allocation_from_analysis_block(richard)
-    if alloc is None or alloc.empty:
-        return None
-
-    fig = px.pie(alloc, names="分類", values="金額", title="資產配置（依 Excel『分析』區塊）")
+    df = richard.copy()
+    df["成交金額"] = to_num(df["成交金額"])
+    alloc = (df.groupby("分類")["成交金額"]
+               .sum()
+               .sort_values(ascending=False)
+               .reset_index()
+               .rename(columns={"成交金額": "金額"}))
+    fig = px.pie(alloc, names="分類", values="金額", title="資金配置：分類")
     fig.update_traces(textposition="inside", textinfo="percent+label")
-    fig.update_layout(height=520)
+    fig.update_layout(height=450)
     return fig
+
+
+def make_yearly_return_combo(richard: pd.DataFrame, mode: str = "已實現"):
+    """
+    直條：年度收益
+    折線：累積收益（含數字標籤）
+    mode:
+      - "已實現"：用「賣出日期」的年度彙總「已實現損益」
+      - "含未實現"：已實現 + 未實現。已實現仍以賣出年度計；未實現沒有賣出日期者，歸入「今年」。
+    """
+    realized_col = "已實現損益"
+    unrealized_col = "未實現損益"
+    sell_date_col = "賣出日期" if "賣出日期" in richard.columns else None
+
+    if realized_col not in richard.columns:
+        return None
+
+    df = _filter_trade_like_rows(richard).copy()
+
+    # 已實現：用賣出日期；若沒有賣出日期欄，則無法做年度收益
+    if sell_date_col is None:
+        return None
+
+    df[sell_date_col] = pd.to_datetime(df[sell_date_col], errors="coerce")
+
+    # 已實現：有賣出日期的列
+    sold = df[df[sell_date_col].notna()].copy()
+    if sold.empty and mode == "已實現":
+        return None
+
+    sold["年度"] = sold[sell_date_col].dt.year
+    sold["年度收益"] = to_num(sold[realized_col])
+
+    yearly_realized = (
+        sold.groupby("年度", as_index=False)["年度收益"]
+        .sum()
+        .sort_values("年度")
+    )
+
+    if mode == "含未實現":
+        # 未實現：沒有賣出日期的列，歸到今年
+        open_pos = df[df[sell_date_col].isna()].copy()
+        if unrealized_col in open_pos.columns and not open_pos.empty:
+            current_year = datetime.date.today().year
+            open_pos["年度"] = current_year
+            open_pos["年度收益"] = to_num(open_pos[unrealized_col])
+            yearly_unrealized = (
+                open_pos.groupby("年度", as_index=False)["年度收益"]
+                .sum()
+                .sort_values("年度")
+            )
+            yearly = pd.concat([yearly_realized, yearly_unrealized], ignore_index=True)
+            yearly = yearly.groupby("年度", as_index=False)["年度收益"].sum().sort_values("年度")
+        else:
+            yearly = yearly_realized
+    else:
+        yearly = yearly_realized
+
+    if yearly.empty:
+        return None
+
+    yearly["累積收益"] = yearly["年度收益"].cumsum()
+    yearly["累積標籤"] = yearly["累積收益"].map(lambda v: f"{v:,.0f}")
+
+    fig = go.Figure()
+    fig.add_bar(x=yearly["年度"], y=yearly["年度收益"], name="年度收益", yaxis="y")
+    fig.add_trace(
+        go.Scatter(
+            x=yearly["年度"],
+            y=yearly["累積收益"],
+            name="累積收益",
+            mode="lines+markers+text",
+            text=yearly["累積標籤"],
+            textposition="top center",
+            yaxis="y2"
+        )
+    )
+
+    fig.update_layout(
+        title=f"投資收益（年度 vs 累積）— {mode}",
+        xaxis=dict(title="年度"),
+        yaxis=dict(title="年度收益"),
+        yaxis2=dict(title="累積收益", overlaying="y", side="right", showgrid=False),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+        height=520
+    )
+    return fig
+
 
 def make_timeseries(acct: pd.DataFrame):
     date_col = "日期" if "日期" in acct.columns else acct.columns[0]
@@ -298,7 +238,27 @@ c5.metric("報酬率", f"{ret*100:,.2f}%")
 
 st.divider()
 
-# ====== 圖表（依你的需求：上台股、下美股、第三張資產配置圓餅；不要併排） ======
+# ====== 圖表順序（由上至下）：投資收益、資產配置、台幣現金水位圖、台股Top10、美股Top10 ======
+mode = st.radio("年度收益模式", ["已實現", "含未實現"], horizontal=True)
+
+yearly_fig = make_yearly_return_combo(richard, mode=mode)
+if yearly_fig is not None:
+    st.plotly_chart(yearly_fig, use_container_width=True)
+else:
+    st.info("無法產生『投資收益（年度 vs 累積）』圖表（請確認 Excel 有『賣出日期 / 已實現損益』）。")
+
+pie = make_allocation_pie_from_analysis(richard)
+if pie is not None:
+    st.plotly_chart(pie, use_container_width=True)
+else:
+    st.warning("找不到 Excel 內『分析』區塊（含『分類』與『參考現值』）或該區塊資料為空。")
+
+ts = make_timeseries(acct)
+if ts is not None:
+    st.plotly_chart(ts, use_container_width=True)
+else:
+    st.warning("帳戶紀錄缺少可用欄位（日期/結餘/本金），無法畫台幣現金水位圖。")
+
 tw_fig = make_rank_chart_by_market(richard, market="台股", top_n=10)
 if tw_fig is not None:
     st.plotly_chart(tw_fig, use_container_width=True)
@@ -310,15 +270,3 @@ if us_fig is not None:
     st.plotly_chart(us_fig, use_container_width=True)
 else:
     st.info("沒有找到可用的美股資料（Top 10）。")
-
-pie = make_allocation_pie_from_analysis(richard)
-if pie is not None:
-    st.plotly_chart(pie, use_container_width=True)
-else:
-    st.warning("找不到 Excel 內『分析』區塊（含『分類』與『參考現值』）或該區塊資料為空。")
-
-st.divider()
-
-ts = make_timeseries(acct)
-if ts is not None:
-    st.plotly_chart(ts, use_container_width=True)
