@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import requests
 import plotly.express as px
 import plotly.graph_objects as go
 from pathlib import Path
@@ -7,6 +8,57 @@ import numpy as np
 import datetime
 
 st.set_page_config(page_title="Family Portfolio Dashboard", layout="wide")
+
+
+# =========================
+# OneDrive Excel 同步（與上傳並存）
+# Secrets 需設定：
+# ONEDRIVE_XLSX_URL = "https://1drv.ms/...."
+# =========================
+def ensure_excel_from_onedrive(xlsx_path: Path) -> bool:
+    url = st.secrets.get("ONEDRIVE_XLSX_URL", "")
+    if not isinstance(url, str) or not url.strip():
+        return False
+    url = url.strip()
+
+    def add_download_param(u: str) -> str:
+        if "download=1" in u:
+            return u
+        return u + ("&" if "?" in u else "?") + "download=1"
+
+    candidates = [url, add_download_param(url)]
+    xlsx_path.parent.mkdir(parents=True, exist_ok=True)
+
+    last_err = None
+    for u in candidates:
+        try:
+            r = requests.get(
+                u,
+                timeout=45,
+                allow_redirects=True,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            r.raise_for_status()
+            content = r.content or b""
+            # xlsx 是 zip，檔頭通常是 PK；避免抓到 OneDrive 預覽 HTML
+            if not content.startswith(b"PK"):
+                last_err = RuntimeError(f"下載內容不是 Excel（前 20 bytes={content[:20]!r}）")
+                continue
+            xlsx_path.write_bytes(content)
+            return True
+        except Exception as e:
+            last_err = e
+            continue
+
+    # 失敗不報錯中斷：仍可用既有檔案或上傳
+    if last_err:
+        st.sidebar.warning(f"OneDrive 下載失敗，將使用既有/上傳檔案：{last_err}")
+    return False
+
+
+def _touch_reload_flag():
+    st.session_state["_reload_data"] = True
+
 
 DATA_DIR = Path(__file__).parent / "data"
 XLSX_PATH = DATA_DIR / "family_data.xlsx"
@@ -453,6 +505,9 @@ def render_trade_details(richard: pd.DataFrame):
 
 
 st.sidebar.title("設定")
+st.sidebar.button("重新載入資料（OneDrive）", on_click=_touch_reload_flag)
+st.sidebar.caption(f"OneDrive：{'已設定' if st.secrets.get('ONEDRIVE_XLSX_URL') else '未設定'}")
+
 if is_admin():
     st.sidebar.markdown("### 管理者操作")
     st.sidebar.info("上傳後會覆蓋 data/family_data.xlsx（只有你能做這件事）")
@@ -464,6 +519,14 @@ if is_admin():
         st.cache_data.clear()
 
 st.title("Richard 的投資儀表板")
+if XLSX_PATH.exists():
+    st.caption(f"資料最後更新時間：{pd.to_datetime(XLSX_PATH.stat().st_mtime, unit='s')}")
+
+
+
+# 嘗試自動同步：首次沒有檔案，或按了「重新載入資料」才會從 OneDrive 抓
+if (not XLSX_PATH.exists()) or st.session_state.pop("_reload_data", False):
+    ensure_excel_from_onedrive(XLSX_PATH)
 
 if not XLSX_PATH.exists():
     st.error("找不到 data/family_data.xlsx。請由管理者登入後上傳 Excel。")
