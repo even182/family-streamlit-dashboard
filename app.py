@@ -5,8 +5,6 @@ from pathlib import Path
 XLSX_PATH = Path("data/family_data.xlsx")
 
 # 嘗試從 OneDrive 取得最新資料（失敗則保留既有/上傳檔）
-ensure_excel_from_onedrive(XLSX_PATH)
-
 def ensure_excel_from_onedrive(xlsx_path: Path) -> bool:
     """
     嘗試從 OneDrive 下載 Excel 到本機（與上傳功能並存）。
@@ -20,6 +18,9 @@ def ensure_excel_from_onedrive(xlsx_path: Path) -> bool:
     if not url0:
         return False
 
+
+# 嘗試從 OneDrive 取得最新資料（失敗則保留既有/上傳檔）
+ensure_excel_from_onedrive(XLSX_PATH)
     def _add_download_param(u: str) -> str:
         if "download=1" in u:
             return u
