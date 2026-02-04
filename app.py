@@ -1,94 +1,3 @@
-
-import requests
-from pathlib import Path
-
-XLSX_PATH = Path("data/family_data.xlsx")
-
-# 嘗試從 OneDrive 取得最新資料（失敗則保留既有/上傳檔）
-def ensure_excel_from_onedrive(xlsx_path: Path) -> bool:
-    """
-    從 OneDrive 下載 Excel（與上傳功能並存）
-    """
-    url = st.secrets.get("ONEDRIVE_XLSX_URL", "")
-    if not isinstance(url, str) or not url.strip():
-        return False
-
-    url = url.strip()
-
-    def add_download_param(u: str) -> str:
-        if "download=1" in u:
-            return u
-        return u + ("&" if "?" in u else "?") + "download=1"
-
-    candidates = [url, add_download_param(url)]
-    xlsx_path.parent.mkdir(parents=True, exist_ok=True)
-
-    for u in candidates:
-        try:
-            r = requests.get(
-                u,
-                timeout=45,
-                allow_redirects=True,
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            r.raise_for_status()
-            content = r.content or b""
-            if not content.startswith(b"PK"):
-                continue
-            xlsx_path.write_bytes(content)
-            return True
-        except Exception:
-            continue
-
-    return False
-
-
-# 嘗試從 OneDrive 取得最新資料（失敗則保留既有/上傳檔）
-ensure_excel_from_onedrive(XLSX_PATH)
-    def _add_download_param(u: str) -> str:
-        if "download=1" in u:
-            return u
-        return (u + ("&" if "?" in u else "?") + "download=1")
-
-    candidates = [url0, _add_download_param(url0)]
-
-    xlsx_path.parent.mkdir(parents=True, exist_ok=True)
-
-    last_err = None
-    for url in candidates:
-        try:
-            r = requests.get(url, timeout=45, allow_redirects=True, headers={"User-Agent": "Mozilla/5.0"})
-            r.raise_for_status()
-            content = r.content or b""
-
-            # 判斷是不是 xlsx（zip 檔頭通常是 PK）
-            if len(content) < 4 or content[:2] != b"PK":
-                # 很可能抓到 HTML 預覽頁
-                ct = r.headers.get("Content-Type", "")
-                last_err = RuntimeError(f"下載內容不是 Excel（Content-Type={ct}，前 20 bytes={content[:20]!r}）")
-                continue
-
-            xlsx_path.write_bytes(content)
-            return True
-        except Exception as e:
-            last_err = e
-            continue
-
-    st.warning(f"OneDrive 下載失敗，將使用既有或上傳的檔案：{last_err}")
-    return False
-
-
-    xlsx_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        r = requests.get(url, timeout=30)
-        r.raise_for_status()
-        xlsx_path.write_bytes(r.content)
-        return True
-    except Exception as e:
-        st.warning(f"OneDrive 下載失敗，將使用既有或上傳的檔案：{e}")
-        return False
-
-
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -542,12 +451,6 @@ def render_trade_details(richard: pd.DataFrame):
     csv = df_view.to_csv(index=False, encoding="utf-8-sig")
     st.download_button("下載明細 CSV", data=csv, file_name="trades.csv", mime="text/csv")
 
-
-st.sidebar.button("重新載入資料", on_click=lambda: ensure_excel_from_onedrive(XLSX_PATH))
-
-st.sidebar.caption(f"OneDrive: {'已設定' if st.secrets.get('ONEDRIVE_XLSX_URL') else '未設定'}")
-if XLSX_PATH.exists():
-    st.sidebar.caption(f"本機資料檔時間：{pd.to_datetime(XLSX_PATH.stat().st_mtime, unit='s')}")
 
 st.sidebar.title("設定")
 if is_admin():
