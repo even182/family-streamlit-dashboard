@@ -7,16 +7,40 @@ XLSX_PATH = Path("data/family_data.xlsx")
 # 嘗試從 OneDrive 取得最新資料（失敗則保留既有/上傳檔）
 def ensure_excel_from_onedrive(xlsx_path: Path) -> bool:
     """
-    嘗試從 OneDrive 下載 Excel 到本機（與上傳功能並存）。
-    - Secrets: ONEDRIVE_XLSX_URL
-    - 會自動嘗試加上 download=1
-    - 會檢查檔案是否為 xlsx（zip: 'PK' 開頭），避免抓到預覽 HTML
-    回傳：是否成功下載並寫入 xlsx_path
+    從 OneDrive 下載 Excel（與上傳功能並存）
     """
-    url0 = st.secrets.get("ONEDRIVE_XLSX_URL", "")
-    url0 = url0.strip() if isinstance(url0, str) else ""
-    if not url0:
+    url = st.secrets.get("ONEDRIVE_XLSX_URL", "")
+    if not isinstance(url, str) or not url.strip():
         return False
+
+    url = url.strip()
+
+    def add_download_param(u: str) -> str:
+        if "download=1" in u:
+            return u
+        return u + ("&" if "?" in u else "?") + "download=1"
+
+    candidates = [url, add_download_param(url)]
+    xlsx_path.parent.mkdir(parents=True, exist_ok=True)
+
+    for u in candidates:
+        try:
+            r = requests.get(
+                u,
+                timeout=45,
+                allow_redirects=True,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            r.raise_for_status()
+            content = r.content or b""
+            if not content.startswith(b"PK"):
+                continue
+            xlsx_path.write_bytes(content)
+            return True
+        except Exception:
+            continue
+
+    return False
 
 
 # 嘗試從 OneDrive 取得最新資料（失敗則保留既有/上傳檔）
