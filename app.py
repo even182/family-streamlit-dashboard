@@ -41,10 +41,102 @@ def to_num(s: pd.Series) -> pd.Series:
         errors="coerce"
     ).fillna(0.0)
 
+
+
+
+# ====== 資產配置（移植自 app01：更穩定的『分析』區塊解析） ======
 def _clean_text(x) -> str:
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return ""
     return str(x).strip()
+
+def extract_allocation_from_analysis_block(richard: pd.DataFrame):
+    """
+    依你附圖的『分析』區塊抓資產配置（更貼近你的版型）：
+    - 先找到含『分析』字樣的列（就算是合併儲存格也可）
+    - 在該列附近分別找出『分類』欄與『參考現值』（若沒有則用『成交金額』）欄
+    - 從分類資料列一路讀到『總計』為止
+    - 回傳 DataFrame: 分類 / 金額
+    """
+    arr = richard.to_numpy(dtype=object)
+    nrows, ncols = arr.shape
+
+    def row_has(token: str, r: int) -> bool:
+        for c in range(ncols):
+            if _clean_text(arr[r, c]) == token:
+                return True
+        return False
+
+    def find_first_row(token: str):
+        for r in range(nrows):
+            for c in range(ncols):
+                if _clean_text(arr[r, c]) == token:
+                    return r
+        return None
+
+    def find_token_near(token: str, r0: int, r1: int):
+        for r in range(max(0, r0), min(nrows, r1 + 1)):
+            for c in range(ncols):
+                if _clean_text(arr[r, c]) == token:
+                    return r, c
+        return None, None
+
+    # 1) 找『分析』作為區塊錨點
+    anchor_r = find_first_row("分析")
+    if anchor_r is None:
+        return None
+
+    # 2) 在錨點附近找『分類』欄位置
+    cat_r, cat_c = find_token_near("分類", anchor_r - 3, anchor_r + 10)
+    if cat_r is None:
+        return None
+
+    # 3) 在錨點附近找『參考現值』（或『成交金額』）欄位置
+    val_r, val_c = find_token_near("參考現值", anchor_r - 3, anchor_r + 10)
+    val_key = "參考現值"
+    if val_r is None:
+        val_r, val_c = find_token_near("成交金額", anchor_r - 3, anchor_r + 10)
+        val_key = "成交金額"
+    if val_r is None:
+        return None
+
+    # 4) 找分類資料起始列：分類表頭下一列往下找第一個非空分類
+    start_r = cat_r + 1
+    while start_r < nrows:
+        cat = _clean_text(arr[start_r, cat_c])
+        if cat and cat not in ["分類"]:
+            break
+        start_r += 1
+
+    items = []
+    for r in range(start_r, nrows):
+        cat = _clean_text(arr[r, cat_c])
+        if not cat:
+            continue
+        if cat == "總計":
+            break
+
+        raw = arr[r, val_c]
+        val = pd.to_numeric(str(raw).replace(",", "").strip(), errors="coerce")
+        if pd.isna(val) or val == 0:
+            continue
+
+        items.append({"分類": cat, "金額": float(val)})
+
+    if not items:
+        return None
+
+    return pd.DataFrame(items)
+
+def make_allocation_pie_from_analysis(richard: pd.DataFrame):
+    alloc = extract_allocation_from_analysis_block(richard)
+    if alloc is None or alloc.empty:
+        return None
+
+    fig = px.pie(alloc, names="分類", values="金額", title="資產配置（依 Excel『分析』區塊）")
+    fig.update_traces(textposition="inside", textinfo="percent+label")
+    fig.update_layout(height=520)
+    return fig
 
 def _filter_trade_like_rows(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -90,13 +182,32 @@ def load_data(xlsx_path: Path):
     return richard, acct
 
 def compute_kpi(richard: pd.DataFrame):
+    """
+    KPI 統計只計入「有分類」的列（你說的 AB 欄有做分類）。
+    - 用欄位名「分類」判斷是否有分類（去除空白後不可為空）
+    - 同時排除 Excel 底部「分析/總計」區塊（透過 _filter_trade_like_rows）
+    """
+    df = richard.copy()
+
+    # 排除非交易列
+    if "_filter_trade_like_rows" in globals():
+        try:
+            df = _filter_trade_like_rows(df)
+        except Exception:
+            pass
+
+    # 只保留「分類」有值的列
+    if "分類" in df.columns:
+        cat = df["分類"].astype(str).str.strip()
+        df = df[cat.notna() & (cat != "") & (cat.str.lower() != "nan")]
+
     invested_col = "成交金額"
     realized_col = "已實現損益"
     unrealized_col = "未實現損益"
 
-    invested = to_num(richard[invested_col]) if invested_col in richard.columns else pd.Series([0.0])
-    realized = to_num(richard[realized_col]) if realized_col in richard.columns else pd.Series([0.0])
-    unrealized = to_num(richard[unrealized_col]) if unrealized_col in richard.columns else pd.Series([0.0])
+    invested = to_num(df[invested_col]) if invested_col in df.columns else pd.Series([0.0])
+    realized = to_num(df[realized_col]) if realized_col in df.columns else pd.Series([0.0])
+    unrealized = to_num(df[unrealized_col]) if unrealized_col in df.columns else pd.Series([0.0])
 
     total_invested = float(invested.sum())
     total_realized = float(realized.sum())
@@ -106,34 +217,45 @@ def compute_kpi(richard: pd.DataFrame):
 
     return total_invested, total_realized, total_unrealized, total_pnl, ret
 
+
 def make_rank_chart_by_market(richard: pd.DataFrame, market: str, top_n: int = 10):
+    """
+    股票別總損益 Top N（嚴格依『分類』欄位過濾）：
+    - 美股：只取 分類 == "美股"
+    - 台股：取 分類 in {"台股", "台股 ETF"}
+    其他分類（如台幣活儲/美金儲蓄/基金等）不納入股票 Top 圖表。
+    """
     realized_col = "已實現損益"
     unrealized_col = "未實現損益"
+    cat_col = "分類"
 
-    df = _filter_trade_like_rows(richard).copy()
-    code_col = "股票代號" if "股票代號" in df.columns else None
+    df = _filter_trade_like_rows(richard)
+
     name_col = "股票名稱" if "股票名稱" in df.columns else ("股票" if "股票" in df.columns else None)
     if name_col is None:
         return None
 
+    # 嚴格依分類過濾
+    if cat_col in df.columns:
+        cat = df[cat_col].astype(str).str.strip()
+        if market == "美股":
+            df = df[cat == "美股"]
+        else:  # 台股
+            df = df[cat.isin(["台股", "台股 ETF"])]
+    else:
+        # 沒有分類欄就不畫（避免誤判）
+        return None
+
+    if df.empty:
+        return None
+
+    # 計算總損益
     df["已實現損益"] = to_num(df[realized_col]) if realized_col in df.columns else 0.0
     df["未實現損益"] = to_num(df[unrealized_col]) if unrealized_col in df.columns else 0.0
     df["總損益"] = df["已實現損益"] + df["未實現損益"]
 
-    df["_market"] = [
-        _infer_market_from_code_or_name(
-            df.iloc[i][code_col] if code_col else "",
-            df.iloc[i][name_col] if name_col else ""
-        )
-        for i in range(len(df))
-    ]
-
-    df_m = df[df["_market"] == market].copy()
-    if df_m.empty:
-        return None
-
     agg = (
-        df_m.groupby(name_col, dropna=True)["總損益"]
+        df.groupby(name_col, dropna=True)["總損益"]
         .sum()
         .sort_values(ascending=False)
         .head(top_n)
@@ -151,105 +273,64 @@ def make_rank_chart_by_market(richard: pd.DataFrame, market: str, top_n: int = 1
     fig.update_layout(height=520, yaxis={"categoryorder": "total ascending"})
     return fig
 
-def extract_allocation_from_analysis_block(richard: pd.DataFrame):
-    """
-    從 Richard 表內抓『分析』區塊的資產配置：
-    - 先找到含『分析』字樣的 row（合併儲存格也可）
-    - 在接下來的數列中找出『分類』欄位位置，以及『參考現值』（若沒有就用『成交金額』）欄位位置
-    - 往下讀到『總計』為止
-    """
-    arr = richard.to_numpy(dtype=object)
-    nrows, ncols = arr.shape
 
-    # 1) 找到 "分析" 的列
-    analysis_row = None
-    for r in range(nrows):
-        row_text = [_clean_text(arr[r, c]) for c in range(ncols)]
-        if any(t == "分析" for t in row_text):
-            analysis_row = r
-            break
-    if analysis_row is None:
-        return None
 
-    # 2) 在後續幾列中找「分類」與「參考現值/成交金額」表頭（不要求同一列）
-    search_rows = range(analysis_row, min(nrows, analysis_row + 10))
-    cat_pos = None
-    val_pos = None
-    val_key = None
-
-    for r in search_rows:
-        for c in range(ncols):
-            t = _clean_text(arr[r, c])
-            if t == "分類" and cat_pos is None:
-                cat_pos = c
-            if t == "參考現值" and val_pos is None:
-                val_pos = c
-                val_key = "參考現值"
-            if t == "成交金額" and val_pos is None and val_key is None:
-                # 先暫存，若後面找到參考現值會覆蓋
-                val_pos = c
-                val_key = "成交金額"
-
-    # 若同時存在參考現值與成交金額，優先參考現值
-    # （上面邏輯：若先遇到成交金額會先設，遇到參考現值會覆蓋）
-    if cat_pos is None or val_pos is None:
-        return None
-
-    # 3) 找到分類資料的起始列：在表頭下方往下找第一個非空分類
-    start_row = None
-    for r in range(analysis_row + 1, nrows):
-        cat = _clean_text(arr[r, cat_pos])
-        if cat and cat not in ["分類", "分析"]:
-            start_row = r
-            break
-    if start_row is None:
-        return None
-
-    items = []
-    for r in range(start_row, nrows):
-        cat = _clean_text(arr[r, cat_pos])
-        if not cat:
-            continue
-        if cat == "總計":
-            break
-
-        val_raw = _clean_text(arr[r, val_pos])
-        val = pd.to_numeric(val_raw.replace(",", ""), errors="coerce")
-        if pd.isna(val) or val == 0:
-            continue
-
-        items.append({"分類": cat, "金額": float(val)})
-
-    if not items:
-        return None
-
-    return pd.DataFrame(items)
-
-def make_allocation_pie_from_analysis(richard: pd.DataFrame):
-    alloc = extract_allocation_from_analysis_block(richard)
-    if alloc is None or alloc.empty:
-        return None
-    fig = px.pie(alloc, names="分類", values="金額", title="資產配置（依 Excel『分析』區塊）")
-    fig.update_traces(textposition="inside", textinfo="percent+label")
-    fig.update_layout(height=520)
-    return fig
 
 def make_timeseries(acct: pd.DataFrame):
+    """
+    台幣現金水位圖：
+    - 同時畫兩條線：台幣現金水位（若有） + 台幣本金（若有）
+    - 若找不到「台幣現金水位」欄位，會退回畫單線（台幣本金/結餘）
+    """
     date_col = "日期" if "日期" in acct.columns else acct.columns[0]
-    # 你想要「台幣現金水位」的話，優先找台幣相關欄位
-    candidates = ["台幣現金", "台幣現金水位", "台幣本金", "結餘"]
-    value_col = next((c for c in candidates if c in acct.columns), None)
-    if value_col is None:
+    df0 = acct.copy()
+    df0[date_col] = pd.to_datetime(df0[date_col], errors="coerce")
+    df0 = df0.dropna(subset=[date_col]).sort_values(date_col)
+
+    # 欄位候選（依你口語：台幣本金 vs 台幣現金水位）
+    principal_candidates = ["台幣本金", "TWD本金", "本金(台幣)"]
+    cash_candidates = ["台幣現金水位", "台幣現金", "現金水位", "台幣結餘", "結餘"]
+
+    principal_col = next((c for c in principal_candidates if c in df0.columns), None)
+    cash_col = next((c for c in cash_candidates if c in df0.columns), None)
+
+    if principal_col is None and cash_col is None:
         return None
 
-    df = acct[[date_col, value_col]].copy()
-    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-    df[value_col] = to_num(df[value_col])
-    df = df.dropna(subset=[date_col]).sort_values(date_col)
+    # 組成長表方便畫多線
+    parts = []
+    if cash_col is not None:
+        tmp = df0[[date_col, cash_col]].copy()
+        tmp["值"] = to_num(tmp[cash_col])
+        tmp["項目"] = "台幣現金水位"
+        parts.append(tmp[[date_col, "值", "項目"]])
 
-    fig = px.line(df, x=date_col, y=value_col, title=f"台幣現金水位圖（來源：帳戶紀錄 / {value_col}）")
-    fig.update_layout(height=450)
+    if principal_col is not None:
+        tmp = df0[[date_col, principal_col]].copy()
+        tmp["值"] = to_num(tmp[principal_col])
+        tmp["項目"] = "台幣本金"
+        parts.append(tmp[[date_col, "值", "項目"]])
+
+    df = pd.concat(parts, ignore_index=True)
+
+    # 若只有一條線，就維持原本標題語意
+    if df["項目"].nunique() == 1:
+        only = df["項目"].iloc[0]
+        fig = px.line(df, x=date_col, y="值", title=f"台幣現金水位圖（來源：帳戶紀錄 / {only}）")
+        fig.update_layout(height=450, yaxis_title=only, legend_title_text="")
+        return fig
+
+    fig = px.line(
+        df,
+        x=date_col,
+        y="值",
+        color="項目",
+        title="台幣現金水位圖（台幣現金水位 vs 台幣本金）"
+    )
+    fig.update_layout(height=450, legend_title_text="")
+    fig.update_yaxes(title_text="金額")
     return fig
+
 
 def make_yearly_return_combo(richard: pd.DataFrame, mode: str = "已實現"):
     """
@@ -316,6 +397,61 @@ def make_yearly_return_combo(richard: pd.DataFrame, mode: str = "已實現"):
     return fig
 
 # ====== 側邊欄：管理者上傳（只有輸入密碼才會出現） ======
+view_mode = st.sidebar.radio("顯示內容", ["圖表", "交易明細"], index=0)
+
+
+def render_trade_details(richard: pd.DataFrame):
+    """右側顯示交易明細（可切換台股/美股）"""
+    st.subheader("交易明細")
+
+    if "分類" not in richard.columns:
+        st.warning("找不到『分類』欄位，無法依台股/美股切換。")
+        st.dataframe(richard, use_container_width=True)
+        return
+
+    market = st.radio("明細篩選", ["台股（含台股 ETF）", "美股", "全部"], horizontal=True)
+
+    df = richard.copy()
+    # 排除非交易列（分析/總計）
+    try:
+        df = _filter_trade_like_rows(df)
+    except Exception:
+        pass
+
+    cat = df["分類"].astype(str).str.strip()
+    if market.startswith("台股"):
+        df = df[cat.isin(["台股", "台股 ETF"])]
+    elif market == "美股":
+        df = df[cat == "美股"]
+    else:
+        df = df[cat.notna() & (cat != "") & (cat.str.lower() != "nan")]
+
+    # 常用欄位排序（有就顯示）
+    preferred_cols = [
+        "買進日期","賣出日期","股票代號","股票名稱","分類",
+        "股數","買進價","賣出價",
+        "成交金額","手續費","交易稅","除息",
+        "已實現損益","未實現損益","參考現值",
+        "買進原因","賣出原因","備註"
+    ]
+    cols = [c for c in preferred_cols if c in df.columns]
+    if cols:
+        df_view = df[cols]
+    else:
+        df_view = df
+
+    # 日期欄轉型（如果存在）
+    for dc in ["買進日期", "賣出日期"]:
+        if dc in df_view.columns:
+            df_view[dc] = pd.to_datetime(df_view[dc], errors="coerce")
+
+    st.dataframe(df_view, use_container_width=True, height=560)
+
+    # 下載
+    csv = df_view.to_csv(index=False, encoding="utf-8-sig")
+    st.download_button("下載明細 CSV", data=csv, file_name="trades.csv", mime="text/csv")
+
+
 st.sidebar.title("設定")
 if is_admin():
     st.sidebar.markdown("### 管理者操作")
@@ -327,7 +463,7 @@ if is_admin():
         st.sidebar.success("已更新 Excel！請重新整理頁面。")
         st.cache_data.clear()
 
-st.title("家庭投資儀表板（只讀）")
+st.title("Richard 的投資儀表板")
 
 if not XLSX_PATH.exists():
     st.error("找不到 data/family_data.xlsx。請由管理者登入後上傳 Excel。")
@@ -346,35 +482,42 @@ c5.metric("報酬率", f"{ret*100:,.2f}%")
 
 st.divider()
 
-# ====== 圖表順序（由上至下）：投資收益、資產配置、台幣現金水位圖、台股Top10、美股Top10 ======
-mode = st.radio("年度收益模式", ["已實現", "含未實現"], horizontal=True)
+if view_mode == "圖表":
+    # ====== 圖表順序（由上至下）：投資收益、資產配置、台幣現金水位圖、台股Top10、美股Top10 ======
+    mode = st.radio("年度收益模式", ["已實現", "含未實現"], horizontal=True)
 
-yearly_fig = make_yearly_return_combo(richard, mode=mode)
-if yearly_fig is not None:
-    st.plotly_chart(yearly_fig, use_container_width=True)
-else:
-    st.info("無法產生『投資收益（年度 vs 累積）』圖表（請確認 Excel 有『賣出日期 / 已實現損益』）。")
+    yearly_fig = make_yearly_return_combo(richard, mode=mode)
+    if yearly_fig is not None:
+        st.plotly_chart(yearly_fig, use_container_width=True)
+    else:
+        st.info("無法產生『投資收益（年度 vs 累積）』圖表（請確認 Excel 有『賣出日期 / 已實現損益』）。")
 
-pie = make_allocation_pie_from_analysis(richard)
-if pie is not None:
-    st.plotly_chart(pie, use_container_width=True)
-else:
-    st.warning("找不到 Excel 內『分析』區塊（含『分類』與『參考現值』）或該區塊資料為空。")
+    pie = make_allocation_pie_from_analysis(richard)
+    if pie is not None:
+        st.plotly_chart(pie, use_container_width=True)
+    else:
+        st.warning("找不到 Excel 內『分析』區塊（含『分類』與『參考現值』）或該區塊資料為空。")
 
-ts = make_timeseries(acct)
-if ts is not None:
-    st.plotly_chart(ts, use_container_width=True)
-else:
-    st.warning("帳戶紀錄缺少台幣現金相關欄位（台幣現金/台幣本金/結餘），無法畫台幣現金水位圖。")
+    ts = make_timeseries(acct)
+    if ts is not None:
+        st.plotly_chart(ts, use_container_width=True)
+    else:
+        st.warning("帳戶紀錄缺少台幣現金相關欄位（台幣現金/台幣本金/結餘），無法畫台幣現金水位圖。")
 
-tw_fig = make_rank_chart_by_market(richard, market="台股", top_n=10)
-if tw_fig is not None:
-    st.plotly_chart(tw_fig, use_container_width=True)
-else:
-    st.info("沒有找到可用的台股資料（Top 10）。")
+    # ④ 台股/美股 Top10（可切換）
+    top_market = st.radio("Top10 類型", ["台股（含台股 ETF）", "美股"], horizontal=True)
 
-us_fig = make_rank_chart_by_market(richard, market="美股", top_n=10)
-if us_fig is not None:
-    st.plotly_chart(us_fig, use_container_width=True)
+    if top_market.startswith("台股"):
+        top_fig = make_rank_chart_by_market(richard, market="台股", top_n=10)
+        if top_fig is not None:
+            st.plotly_chart(top_fig, use_container_width=True)
+        else:
+            st.info("沒有找到可用的台股資料（Top 10）。")
+    else:
+        top_fig = make_rank_chart_by_market(richard, market="美股", top_n=10)
+        if top_fig is not None:
+            st.plotly_chart(top_fig, use_container_width=True)
+        else:
+            st.info("沒有找到可用的美股資料（Top 10）。")
 else:
-    st.info("沒有找到可用的美股資料（Top 10）。")
+    render_trade_details(richard)
