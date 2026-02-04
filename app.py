@@ -1,3 +1,25 @@
+
+import requests
+from pathlib import Path
+
+XLSX_PATH = Path("data/family_data.xlsx")
+
+def ensure_excel_from_onedrive(xlsx_path: Path):
+    url = st.secrets.get("ONEDRIVE_XLSX_URL", "").strip()
+    if not url:
+        return False
+
+    xlsx_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        xlsx_path.write_bytes(r.content)
+        return True
+    except Exception as e:
+        st.warning(f"OneDrive 下載失敗，將使用既有或上傳的檔案：{e}")
+        return False
+
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -451,6 +473,8 @@ def render_trade_details(richard: pd.DataFrame):
     csv = df_view.to_csv(index=False, encoding="utf-8-sig")
     st.download_button("下載明細 CSV", data=csv, file_name="trades.csv", mime="text/csv")
 
+
+st.sidebar.button("重新載入資料", on_click=lambda: ensure_excel_from_onedrive(XLSX_PATH))
 
 st.sidebar.title("設定")
 if is_admin():
