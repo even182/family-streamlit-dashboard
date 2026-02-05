@@ -7,8 +7,8 @@ from pathlib import Path
 import numpy as np
 import datetime
 import re
-import time
-BUILD_TAG = "re-import-fix-" + str(int(time.time()))
+#import time
+#BUILD_TAG = "re-import-fix-" + str(int(time.time()))
 
 st.set_page_config(page_title="Family Portfolio Dashboard", layout="wide")
 
@@ -513,7 +513,7 @@ def make_yearly_return_combo(richard: pd.DataFrame, mode: str = "已實現"):
 
 # ====== 側邊欄：管理者上傳（只有輸入密碼才會出現） ======
 view_mode = st.sidebar.radio("顯示內容", ["圖表", "交易明細"], index=0)
-st.sidebar.caption(f"BUILD_TAG: {BUILD_TAG}")
+#st.sidebar.caption(f"BUILD_TAG: {BUILD_TAG}")
 
 
 def render_trade_details(richard: pd.DataFrame):
