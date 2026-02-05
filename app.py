@@ -5,6 +5,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from pathlib import Path
 import numpy as np
+import re
 import datetime
 
 st.set_page_config(page_title="Family Portfolio Dashboard", layout="wide")
