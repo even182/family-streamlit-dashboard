@@ -491,7 +491,20 @@ def make_yearly_return_combo(richard: pd.DataFrame, mode: str = "已實現"):
     yearly["累積標籤"] = yearly["累積收益"].map(lambda v: f"{v:,.0f}")
 
     fig = go.Figure()
-    fig.add_bar(x=yearly["年度"], y=yearly["年度收益"], name="年度收益", yaxis="y")
+
+    # 年度收益：正值/負值用不同顏色（獲利/虧損一眼看懂）
+    bar_colors = np.where(yearly["年度收益"] >= 0, "#1f77b4", "#d62728")
+    bar_text = yearly["年度收益"].map(lambda v: f"{v:,.0f}")
+    fig.add_bar(
+        x=yearly["年度"],
+        y=yearly["年度收益"],
+        name="年度收益",
+        marker_color=bar_colors,
+        text=bar_text,
+        textposition="outside",
+        yaxis="y",
+    )
+
     fig.add_trace(go.Scatter(
         x=yearly["年度"], y=yearly["累積收益"],
         name="累積收益",
@@ -507,7 +520,8 @@ def make_yearly_return_combo(richard: pd.DataFrame, mode: str = "已實現"):
         yaxis=dict(title="年度收益"),
         yaxis2=dict(title="累積收益", overlaying="y", side="right", showgrid=False),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
-        height=520
+        height=520,
+        margin=dict(t=80)
     )
     return fig
 
