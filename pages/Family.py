@@ -333,12 +333,17 @@ def compute_kpi(Family: pd.DataFrame):
     return total_invested, total_realized, total_unrealized, total_pnl, ret
 
 
+
 def make_rank_chart_by_market(Family: pd.DataFrame, market: str, top_n: int = 10):
     """
     股票別總損益 Top N（嚴格依『分類』欄位過濾）：
     - 美股：只取 分類 == "美股"
     - 台股：取 分類 in {"台股", "台股 ETF"}
     其他分類（如台幣活儲/美金儲蓄/基金等）不納入股票 Top 圖表。
+
+    顯示規則：
+    - 總損益 >= 0：藍色
+    - 總損益 < 0：紅色
     """
     realized_col = "已實現損益"
     unrealized_col = "未實現損益"
@@ -371,21 +376,39 @@ def make_rank_chart_by_market(Family: pd.DataFrame, market: str, top_n: int = 10
 
     agg = (
         df.groupby(name_col, dropna=True)["總損益"]
-        .sum()
-        .sort_values(ascending=False)
-        .head(top_n)
-        .reset_index()
-        .rename(columns={name_col: "股票", "總損益": "總損益"})
+          .sum()
+          .sort_values(ascending=False)
+          .head(top_n)
+          .reset_index()
+          .rename(columns={name_col: "股票", "總損益": "總損益"})
     )
 
-    fig = px.bar(
-        agg,
-        x="總損益",
-        y="股票",
+    if agg.empty:
+        return None
+
+    # 依正負設定顏色
+    bar_colors = np.where(agg["總損益"] >= 0, "#1f77b4", "#d62728")
+    bar_text = agg["總損益"].map(lambda v: f"{v:,.0f}")
+
+    fig = go.Figure()
+    fig.add_bar(
+        x=agg["總損益"],
+        y=agg["股票"],
         orientation="h",
-        title=f"{market} 股票別總損益 Top {top_n}"
+        name="總損益",
+        marker_color=bar_colors,
+        text=bar_text,
+        textposition="outside",
     )
-    fig.update_layout(height=520, yaxis={"categoryorder": "total ascending"})
+
+    fig.update_layout(
+        title=f"{market} 股票別總損益 Top {top_n}",
+        height=520,
+        margin=dict(t=70),
+        showlegend=False,
+    )
+    fig.update_xaxes(title="總損益", zeroline=True, zerolinewidth=1, zerolinecolor="gray")
+    fig.update_yaxes(title="股票", categoryorder="total ascending")
     return fig
 
 
@@ -491,20 +514,7 @@ def make_yearly_return_combo(Family: pd.DataFrame, mode: str = "已實現"):
     yearly["累積標籤"] = yearly["累積收益"].map(lambda v: f"{v:,.0f}")
 
     fig = go.Figure()
-
-    # 年度收益：正值/負值用不同顏色（獲利/虧損一眼看懂）
-    bar_colors = np.where(yearly["年度收益"] >= 0, "#1f77b4", "#d62728")
-    bar_text = yearly["年度收益"].map(lambda v: f"{v:,.0f}")
-    fig.add_bar(
-        x=yearly["年度"],
-        y=yearly["年度收益"],
-        name="年度收益",
-        marker_color=bar_colors,
-        text=bar_text,
-        textposition="outside",
-        yaxis="y",
-    )
-
+    fig.add_bar(x=yearly["年度"], y=yearly["年度收益"], name="年度收益", yaxis="y")
     fig.add_trace(go.Scatter(
         x=yearly["年度"], y=yearly["累積收益"],
         name="累積收益",
@@ -520,8 +530,7 @@ def make_yearly_return_combo(Family: pd.DataFrame, mode: str = "已實現"):
         yaxis=dict(title="年度收益"),
         yaxis2=dict(title="累積收益", overlaying="y", side="right", showgrid=False),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
-        height=520,
-        margin=dict(t=80)
+        height=520
     )
     return fig
 
