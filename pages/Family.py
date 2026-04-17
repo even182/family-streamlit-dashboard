@@ -470,66 +470,174 @@ def make_timeseries(acct: pd.DataFrame):
     return fig
 
 
-def make_yearly_return_combo(Family: pd.DataFrame, mode: str = "已實現"):
+def make_yearly_return_combo(Family: pd.DataFrame, mode: str = "已實現", attrib: str = "A"):
     """
     直條：年度收益
     折線：累積收益（含數字標籤）
-    mode:
-      - "已實現"：用「賣出日期」年度彙總「已實現損益」
-      - "含未實現"：已實現 + 未實現。未實現（無賣出日期）歸入今年。
+
+    修正重點：
+    1. 年度欄位強制清洗，避免出現 2500 / 1900 / NaN 之類異常年份把 X 軸拉爆。
+    2. 只保留合理年份區間（預設 2000 ~ 2100）。
+    3. X 軸改用 category，避免 Plotly 把年份當連續數值軸，導致資料全擠在左邊。
+    4. 左右軸 range 分開自動計算，讓年度收益與累積收益視覺更穩定。
     """
     realized_col = "已實現損益"
     unrealized_col = "未實現損益"
+
+    buy_date_col = "買進日期" if "買進日期" in Family.columns else None
     sell_date_col = "賣出日期" if "賣出日期" in Family.columns else None
-    if sell_date_col is None or realized_col not in Family.columns:
+
+    if realized_col not in Family.columns:
         return None
 
+    def _clean_year_series(s: pd.Series, min_year: int = 2000, max_year: int = 2100) -> pd.Series:
+        y = pd.to_numeric(s, errors="coerce")
+        y = y.where(y.between(min_year, max_year))
+        return y.astype("Int64")
+
+    def _compute_axis_range(values, pad_ratio: float = 0.15):
+        vals = pd.Series(values, dtype="float64").replace([np.inf, -np.inf], np.nan).dropna()
+        if vals.empty:
+            return None
+        vmin = float(vals.min())
+        vmax = float(vals.max())
+        if vmin == vmax:
+            pad = max(abs(vmax) * pad_ratio, 1.0)
+            return [vmin - pad, vmax + pad]
+        span = vmax - vmin
+        pad = max(span * pad_ratio, 1.0)
+        return [vmin - pad, vmax + pad]
+
     df = _filter_trade_like_rows(Family).copy()
-    df[sell_date_col] = pd.to_datetime(df[sell_date_col], errors="coerce")
 
-    sold = df[df[sell_date_col].notna()].copy()
-    sold["年度"] = sold[sell_date_col].dt.year
-    sold["年度收益"] = to_num(sold[realized_col])
-    yearly_realized = sold.groupby("年度", as_index=False)["年度收益"].sum().sort_values("年度")
+    # 日期欄位轉換
+    if buy_date_col is not None:
+        df[buy_date_col] = pd.to_datetime(df[buy_date_col], errors="coerce")
+    if sell_date_col is not None:
+        df[sell_date_col] = pd.to_datetime(df[sell_date_col], errors="coerce")
 
-    if mode == "含未實現":
+    # 只計入有賣出日的「已實現」列
+    sold = df.copy()
+    if sell_date_col is not None:
+        sold = sold[sold[sell_date_col].notna()].copy()
+
+    # ===== 年度收益（已實現）依 attrib 決定歸類年度 =====
+    yearly_realized = None
+
+    if mode == "已實現":
+        if attrib == "A":
+            if sell_date_col is None:
+                return None
+            sold["年度"] = _clean_year_series(sold[sell_date_col].dt.year)
+            sold["年度收益"] = to_num(sold[realized_col])
+            sold = sold[sold["年度"].notna()].copy()
+            yearly_realized = sold.groupby("年度", as_index=False)["年度收益"].sum().sort_values("年度")
+
+        elif attrib == "B":
+            if buy_date_col is None:
+                return None
+            sold = sold[sold[buy_date_col].notna()].copy()
+            sold["年度"] = _clean_year_series(sold[buy_date_col].dt.year)
+            sold["年度收益"] = to_num(sold[realized_col])
+            sold = sold[sold["年度"].notna()].copy()
+            yearly_realized = sold.groupby("年度", as_index=False)["年度收益"].sum().sort_values("年度")
+
+        elif attrib == "C":
+            if buy_date_col is None or sell_date_col is None:
+                return None
+            d = sold[sold[buy_date_col].notna() & sold[sell_date_col].notna()].copy()
+            if d.empty:
+                return None
+
+            pnl = to_num(d[realized_col]).fillna(0.0).to_numpy()
+            rows = []
+            for i, r in enumerate(d.itertuples(index=False)):
+                b = getattr(r, buy_date_col)
+                s = getattr(r, sell_date_col)
+                if pd.isna(b) or pd.isna(s):
+                    continue
+                b = pd.Timestamp(b).normalize()
+                s = pd.Timestamp(s).normalize()
+
+                if s < b:
+                    if 2000 <= s.year <= 2100:
+                        rows.append((s.year, float(pnl[i])))
+                    continue
+
+                total_days = max((s - b).days + 1, 1)
+                for y in range(b.year, s.year + 1):
+                    if not (2000 <= y <= 2100):
+                        continue
+                    seg_start = max(b, pd.Timestamp(f"{y}-01-01"))
+                    seg_end = min(s, pd.Timestamp(f"{y}-12-31"))
+                    seg_days = (seg_end - seg_start).days + 1
+                    if seg_days <= 0:
+                        continue
+                    rows.append((y, float(pnl[i]) * (seg_days / total_days)))
+
+            if not rows:
+                return None
+            tmp = pd.DataFrame(rows, columns=["年度", "年度收益"])
+            tmp["年度"] = _clean_year_series(tmp["年度"])
+            tmp = tmp[tmp["年度"].notna()].copy()
+            yearly_realized = tmp.groupby("年度", as_index=False)["年度收益"].sum().sort_values("年度")
+
+        else:
+            return None
+
+        yearly = yearly_realized
+
+    else:
+        if sell_date_col is None:
+            return None
+
+        sold2 = df[df[sell_date_col].notna()].copy()
+        sold2["年度"] = _clean_year_series(sold2[sell_date_col].dt.year)
+        sold2["年度收益"] = to_num(sold2[realized_col])
+        sold2 = sold2[sold2["年度"].notna()].copy()
+        yearly_realized = sold2.groupby("年度", as_index=False)["年度收益"].sum().sort_values("年度")
+
         open_pos = df[df[sell_date_col].isna()].copy()
         if unrealized_col in open_pos.columns and not open_pos.empty:
             current_year = datetime.date.today().year
-            open_pos["年度"] = current_year
+            open_pos["年度"] = _clean_year_series(pd.Series([current_year] * len(open_pos), index=open_pos.index))
             open_pos["年度收益"] = to_num(open_pos[unrealized_col])
+            open_pos = open_pos[open_pos["年度"].notna()].copy()
             yearly_unrealized = open_pos.groupby("年度", as_index=False)["年度收益"].sum().sort_values("年度")
-
             yearly = pd.concat([yearly_realized, yearly_unrealized], ignore_index=True)
             yearly = yearly.groupby("年度", as_index=False)["年度收益"].sum().sort_values("年度")
         else:
             yearly = yearly_realized
-    else:
-        yearly = yearly_realized
 
-    if yearly.empty:
+    if yearly is None or yearly.empty:
         return None
 
+    yearly = yearly.dropna(subset=["年度"]).copy()
+    yearly["年度"] = yearly["年度"].astype(int)
+    yearly = yearly.groupby("年度", as_index=False)["年度收益"].sum().sort_values("年度")
     yearly["累積收益"] = yearly["年度收益"].cumsum()
+    yearly["年度標籤"] = yearly["年度收益"].map(lambda v: f"{v:,.0f}")
     yearly["累積標籤"] = yearly["累積收益"].map(lambda v: f"{v:,.0f}")
+    yearly["年度文字位置"] = np.where(yearly["年度收益"] >= 0, "outside", "inside")
+    yearly["年度_str"] = yearly["年度"].astype(str)
 
     fig = go.Figure()
 
-    # 年度收益：正值/負值用不同顏色（獲利/虧損一眼看懂）
     bar_colors = np.where(yearly["年度收益"] >= 0, "#1f77b4", "#d62728")
-    bar_text = yearly["年度收益"].map(lambda v: f"{v:,.0f}")
     fig.add_bar(
-        x=yearly["年度"],
+        x=yearly["年度_str"],
         y=yearly["年度收益"],
         name="年度收益",
         marker_color=bar_colors,
-        text=bar_text,
-        textposition="outside",
+        text=yearly["年度標籤"],
+        textposition=yearly["年度文字位置"],
+        cliponaxis=False,
         yaxis="y",
     )
 
     fig.add_trace(go.Scatter(
-        x=yearly["年度"], y=yearly["累積收益"],
+        x=yearly["年度_str"],
+        y=yearly["累積收益"],
         name="累積收益",
         mode="lines+markers+text",
         text=yearly["累積標籤"],
@@ -537,14 +645,24 @@ def make_yearly_return_combo(Family: pd.DataFrame, mode: str = "已實現"):
         yaxis="y2"
     ))
 
+    left_range = _compute_axis_range(yearly["年度收益"])
+    right_range = _compute_axis_range(yearly["累積收益"])
+    title_suffix = mode if mode != "已實現" else f"{mode}（{attrib}）"
+
     fig.update_layout(
-        title=f"投資收益（年度 vs 累積）— {mode}",
-        xaxis=dict(title="年度"),
-        yaxis=dict(title="年度收益"),
-        yaxis2=dict(title="累積收益", overlaying="y", side="right", showgrid=False),
+        title=f"投資收益（年度 vs 累積）— {title_suffix}",
+        xaxis=dict(
+            title="年度",
+            type="category",
+            categoryorder="array",
+            categoryarray=yearly["年度_str"].tolist(),
+        ),
+        yaxis=dict(title="年度收益", range=left_range),
+        yaxis2=dict(title="累積收益", overlaying="y", side="right", showgrid=False, range=right_range),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
         height=520,
-        margin=dict(t=80)
+        margin=dict(t=80, b=50),
+        bargap=0.35,
     )
     return fig
 
@@ -670,7 +788,11 @@ if view_mode == "圖表":
     # ====== 圖表順序（由上至下）：投資收益、資產配置、台幣現金水位圖、台股Top10、美股Top10 ======
     mode = st.radio("年度收益模式", ["已實現", "含未實現"], horizontal=True)
 
-    yearly_fig = make_yearly_return_combo(Family, mode=mode)
+    # 年度歸類方式：主要用在「已實現」模式
+    attrib = st.radio("年度歸類方式（已實現用）", ["A 賣出年度（實現制）", "B 買進年度（決策歸因）", "C 跨年度攤提（天數分攤）"], horizontal=True)
+    attrib_key = attrib.split()[0]  # 取 A/B/C
+
+    yearly_fig = make_yearly_return_combo(Family, mode=mode, attrib=attrib_key)
     if yearly_fig is not None:
         st.plotly_chart(yearly_fig, use_container_width=True)
     else:
