@@ -130,7 +130,13 @@ def _touch_reload_flag(source: str):
     st.session_state["_reload_source"] = source
 
 
-DATA_DIR = Path(__file__).parent / "data"
+BASE_DIR = Path(__file__).resolve().parent
+if (BASE_DIR / "data").exists():
+    DATA_DIR = BASE_DIR / "data"
+elif (BASE_DIR.parent / "data").exists():
+    DATA_DIR = BASE_DIR.parent / "data"
+else:
+    DATA_DIR = BASE_DIR / "data"
 XLSX_PATH = DATA_DIR / "family_data.xlsx"
 
 # ====== 管理者驗證（用 Streamlit Secrets：ADMIN_PASSWORD）======
@@ -250,8 +256,101 @@ def extract_allocation_from_analysis_block(Family: pd.DataFrame):
 
     return pd.DataFrame(items)
 
-def make_allocation_pie_from_analysis(Family: pd.DataFrame):
-    alloc = extract_allocation_from_analysis_block(Family)
+def extract_allocation_from_analysis_sheet(xlsx_path: Path, sheet_name: str = "Family"):
+    """
+    直接從 Excel 工作表讀『分析』區塊，避免 DataFrame 因合併儲存格/空白欄位而錯位。
+    這一版會以 Excel 原始座標找：分析 / 分類 / 參考現值，
+    因此能正確抓到台幣活儲、台股、台股 ETF、美股、美金儲蓄等列。
+    """
+    if not xlsx_path.exists():
+        return None
+
+    try:
+        wb = load_workbook(xlsx_path, data_only=True, read_only=True)
+    except Exception:
+        return None
+
+    if sheet_name not in wb.sheetnames:
+        return None
+
+    ws = wb[sheet_name]
+
+    def clean(v):
+        if v is None:
+            return ""
+        return str(v).strip()
+
+    anchor = None
+    for row in ws.iter_rows():
+        for cell in row:
+            if clean(cell.value) == "分析":
+                anchor = (cell.row, cell.column)
+                break
+        if anchor:
+            break
+    if not anchor:
+        return None
+
+    ar, ac = anchor
+
+    def find_near(token, r0, r1, c0=None, c1=None):
+        r0 = max(1, r0)
+        r1 = min(ws.max_row, r1)
+        c0 = 1 if c0 is None else max(1, c0)
+        c1 = ws.max_column if c1 is None else min(ws.max_column, c1)
+        for r in range(r0, r1 + 1):
+            for c in range(c0, c1 + 1):
+                if clean(ws.cell(r, c).value) == token:
+                    return r, c
+        return None, None
+
+    cat_r, cat_c = find_near("分類", ar - 3, ar + 12)
+    if cat_r is None:
+        return None
+
+    val_r, val_c = find_near("參考現值", ar - 3, ar + 12)
+    if val_r is None:
+        val_r, val_c = find_near("成交金額", ar - 3, ar + 12)
+    if val_r is None:
+        return None
+
+    items = []
+    r = cat_r + 1
+    while r <= ws.max_row:
+        cat = clean(ws.cell(r, cat_c).value)
+        if not cat:
+            r += 1
+            continue
+        if cat == "總計":
+            break
+
+        raw = ws.cell(r, val_c).value
+        val = pd.to_numeric(str(raw).replace(",", "").strip(), errors="coerce")
+        if pd.isna(val):
+            r += 1
+            continue
+
+        items.append({"分類": cat, "金額": float(val)})
+        r += 1
+
+    if not items:
+        return None
+
+    alloc = pd.DataFrame(items)
+    alloc = alloc[alloc["金額"].fillna(0) != 0].copy()
+    return alloc if not alloc.empty else None
+
+
+def make_allocation_pie_from_analysis(Family: pd.DataFrame, xlsx_path: Path | None = None):
+    # 優先用 Excel 原始工作表解析，避免與『分析』區塊顯示不一致
+    alloc = None
+    if xlsx_path is not None:
+        alloc = extract_allocation_from_analysis_sheet(xlsx_path, sheet_name="Family")
+
+    # 若工作表解析失敗，再退回 DataFrame 版本
+    if alloc is None or alloc.empty:
+        alloc = extract_allocation_from_analysis_block(Family)
+
     if alloc is None or alloc.empty:
         return None
 
@@ -819,7 +918,7 @@ if view_mode == "圖表":
     else:
         st.info("無法產生『投資收益（年度 vs 累積）』圖表（請確認 Excel 有『賣出日期 / 已實現損益』）。")
 
-    pie = make_allocation_pie_from_analysis(Family)
+    pie = make_allocation_pie_from_analysis(Family, XLSX_PATH)
     if pie is not None:
         st.plotly_chart(pie, use_container_width=True)
     else:
