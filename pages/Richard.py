@@ -123,7 +123,7 @@ def _touch_reload_flag(source: str):
     st.session_state["_reload_source"] = source
 
 
-DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 XLSX_PATH = DATA_DIR / "family_data.xlsx"
 
 # ====== 管理者驗證（用 Streamlit Secrets：ADMIN_PASSWORD）======
@@ -414,86 +414,44 @@ def make_rank_chart_by_market(richard: pd.DataFrame, market: str, top_n: int = 1
 
 
 
-
-def _normalize_col_name(col) -> str:
-    s = str(col).strip()
-    s = re.sub(r"\.\d+$", "", s)  # pandas 對重複欄名常加 .1 / .2
-    return s
-
-def _pick_account_columns(acct: pd.DataFrame):
-    cols = list(acct.columns)
-    norm = [_normalize_col_name(c) for c in cols]
-
-    # 日期欄
-    date_idx = next((i for i, n in enumerate(norm) if n == "日期"), 0)
-    date_col = cols[date_idx]
-
-    # 台幣本金欄
-    principal_idx = next((i for i, n in enumerate(norm) if n == "台幣本金"), None)
-    principal_col = cols[principal_idx] if principal_idx is not None else None
-
-    # 現金水位欄：
-    # 優先抓「台幣現金水位/台幣現金/現金水位/台幣結餘」；
-    # 若只有重複的「結餘」，優先取「台幣本金」左側最近的那個（避免抓到美金結餘）
-    preferred = ["台幣現金水位", "台幣現金", "現金水位", "台幣結餘"]
-    cash_idx = next((i for i, n in enumerate(norm) if n in preferred), None)
-
-    if cash_idx is None:
-        balance_idxs = [i for i, n in enumerate(norm) if n == "結餘"]
-        if balance_idxs:
-            if principal_idx is not None:
-                left_side = [i for i in balance_idxs if i < principal_idx]
-                cash_idx = left_side[-1] if left_side else balance_idxs[0]
-            else:
-                cash_idx = balance_idxs[0]
-
-    cash_col = cols[cash_idx] if cash_idx is not None else None
-    return {
-        "date_col": date_col,
-        "principal_col": principal_col,
-        "cash_col": cash_col,
-        "all_columns": cols,
-        "normalized_columns": norm,
-    }
-
 def make_timeseries(acct: pd.DataFrame):
     """
     台幣現金水位圖：
-    - 優先固定抓「日期 / 台幣本金 / 台幣結餘」
-    - 若 Excel 有重複欄名（例如台幣結餘、美金結餘都叫『結餘』），
-      會優先抓「台幣本金左側最近的結餘」作為台幣現金水位
+    - 同時畫兩條線：台幣現金水位（若有） + 台幣本金（若有）
+    - 若找不到「台幣現金水位」欄位，會退回畫單線（台幣本金/結餘）
     """
-    picked = _pick_account_columns(acct)
-    date_col = picked["date_col"]
-    principal_col = picked["principal_col"]
-    cash_col = picked["cash_col"]
-
+    date_col = "日期" if "日期" in acct.columns else acct.columns[0]
     df0 = acct.copy()
     df0[date_col] = pd.to_datetime(df0[date_col], errors="coerce")
     df0 = df0.dropna(subset=[date_col]).sort_values(date_col)
 
+    # 欄位候選（依你口語：台幣本金 vs 台幣現金水位）
+    principal_candidates = ["台幣本金", "TWD本金", "本金(台幣)"]
+    cash_candidates = ["台幣現金水位", "台幣現金", "現金水位", "台幣結餘", "結餘"]
+
+    principal_col = next((c for c in principal_candidates if c in df0.columns), None)
+    cash_col = next((c for c in cash_candidates if c in df0.columns), None)
+
     if principal_col is None and cash_col is None:
         return None
 
+    # 組成長表方便畫多線
     parts = []
     if cash_col is not None:
-        tmp = pd.DataFrame({
-            date_col: df0[date_col],
-            "值": to_num(df0[cash_col]),
-            "項目": "台幣現金水位"
-        })
-        parts.append(tmp)
+        tmp = df0[[date_col, cash_col]].copy()
+        tmp["值"] = to_num(tmp[cash_col])
+        tmp["項目"] = "台幣現金水位"
+        parts.append(tmp[[date_col, "值", "項目"]])
 
     if principal_col is not None:
-        tmp = pd.DataFrame({
-            date_col: df0[date_col],
-            "值": to_num(df0[principal_col]),
-            "項目": "台幣本金"
-        })
-        parts.append(tmp)
+        tmp = df0[[date_col, principal_col]].copy()
+        tmp["值"] = to_num(tmp[principal_col])
+        tmp["項目"] = "台幣本金"
+        parts.append(tmp[[date_col, "值", "項目"]])
 
     df = pd.concat(parts, ignore_index=True)
 
+    # 若只有一條線，就維持原本標題語意
     if df["項目"].nunique() == 1:
         only = df["項目"].iloc[0]
         fig = px.line(df, x=date_col, y="值", title=f"台幣現金水位圖（來源：帳戶紀錄 / {only}）")
@@ -673,37 +631,23 @@ if XLSX_PATH.exists():
 # 嘗試自動同步：首次沒有檔案，或按了「重新載入」才會從雲端抓（Google Drive 優先，其次 OneDrive）
 source = st.session_state.pop("_reload_source", None)
 need_fetch = (not XLSX_PATH.exists()) or (source in ("gdrive", "onedrive"))
-actual_source = "local"
-fetched = False
-
 if need_fetch:
+    fetched = False
     # 1) 指定來源
     if source == "gdrive":
         fetched = ensure_excel_from_gdrive(XLSX_PATH)
-        actual_source = "gdrive" if fetched else "gdrive_failed"
         if (not fetched) and st.secrets.get("ONEDRIVE_XLSX_URL"):
             fetched = ensure_excel_from_onedrive(XLSX_PATH)
-            if fetched:
-                actual_source = "onedrive_fallback"
-
     elif source == "onedrive":
         fetched = ensure_excel_from_onedrive(XLSX_PATH)
-        actual_source = "onedrive" if fetched else "onedrive_failed"
         if (not fetched) and (st.secrets.get("GOOGLE_SHEETS_URL") or st.secrets.get("GDRIVE_FILE_URL")):
             fetched = ensure_excel_from_gdrive(XLSX_PATH)
-            if fetched:
-                actual_source = "gdrive_fallback"
-
     else:
         # 2) 未指定：有設定 Google Drive 就先試，失敗再試 OneDrive
         if st.secrets.get("GOOGLE_SHEETS_URL") or st.secrets.get("GDRIVE_FILE_URL"):
             fetched = ensure_excel_from_gdrive(XLSX_PATH)
-            if fetched:
-                actual_source = "gdrive"
         if (not fetched) and st.secrets.get("ONEDRIVE_XLSX_URL"):
             fetched = ensure_excel_from_onedrive(XLSX_PATH)
-            if fetched:
-                actual_source = "onedrive"
 
     if fetched:
         st.cache_data.clear()
@@ -712,24 +656,7 @@ if not XLSX_PATH.exists():
     st.error("找不到 data/family_data.xlsx。請由管理者登入後上傳 Excel。")
     st.stop()
 
-
 richard, acct = load_data(XLSX_PATH, XLSX_PATH.stat().st_mtime)
-
-picked_cols = _pick_account_columns(acct)
-with st.expander("偵錯資訊（資料來源 / 路徑 / 欄位）", expanded=False):
-    st.write("資料來源判定：", actual_source)
-    st.write("實際讀取檔案：", str(XLSX_PATH))
-    st.write("本機副本最後修改時間：", pd.to_datetime(XLSX_PATH.stat().st_mtime, unit='s'))
-    st.write("Richard-帳戶紀錄 欄位：", list(acct.columns))
-    st.write("正規化後欄位：", picked_cols["normalized_columns"])
-    st.write("抓到的日期欄：", picked_cols["date_col"])
-    st.write("抓到的台幣本金欄：", picked_cols["principal_col"])
-    st.write("抓到的台幣現金水位欄：", picked_cols["cash_col"])
-    preview_cols = [c for c in [picked_cols["date_col"], picked_cols["cash_col"], picked_cols["principal_col"]] if c is not None]
-    if preview_cols:
-        st.write("畫圖用資料最後 15 筆：")
-        st.dataframe(acct[preview_cols].tail(15), use_container_width=True)
-
 
 # ====== KPI ======
 total_invested, total_realized, total_unrealized, total_pnl, ret = compute_kpi(richard)
