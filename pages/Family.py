@@ -117,13 +117,7 @@ def _touch_reload_flag(source: str):
     st.session_state["_reload_source"] = source
 
 
-BASE_DIR = Path(__file__).resolve().parent
-if (BASE_DIR / "data").exists():
-    DATA_DIR = BASE_DIR / "data"
-elif (BASE_DIR.parent / "data").exists():
-    DATA_DIR = BASE_DIR.parent / "data"
-else:
-    DATA_DIR = BASE_DIR / "data"
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 XLSX_PATH = DATA_DIR / "family_data.xlsx"
 
 
