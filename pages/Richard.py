@@ -119,33 +119,10 @@ def ensure_excel_from_gdrive(xlsx_path: Path) -> bool:
         st.sidebar.warning(f"Google Drive 下載失敗，將使用既有/上傳檔案：{e}")
         return False
 
-def _touch_reload_flag(source: str):
-    st.session_state["_reload_source"] = source
-
-
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 XLSX_PATH = DATA_DIR / "family_data.xlsx"
 
 # ====== 管理者驗證（用 Streamlit Secrets：ADMIN_PASSWORD）======
-def is_admin() -> bool:
-    if st.session_state.get("is_admin", False):
-        return True
-
-    admin_pw = st.secrets.get("ADMIN_PASSWORD", "")
-    if not admin_pw:
-        return False
-
-    with st.sidebar.expander("管理者登入", expanded=False):
-        pw = st.text_input("管理者密碼", type="password", key="admin_pw_input")
-        if st.button("登入", key="admin_login_btn"):
-            if pw == admin_pw:
-                st.session_state["is_admin"] = True
-                st.success("已進入管理者模式")
-                st.rerun()
-            else:
-                st.error("密碼錯誤")
-    return False
-
 # ====== 小工具：把文字數字清乾淨 ======
 def to_num(s: pd.Series) -> pd.Series:
     return pd.to_numeric(
@@ -605,22 +582,6 @@ def render_trade_details(richard: pd.DataFrame):
     st.download_button("下載明細 CSV", data=csv, file_name="trades.csv", mime="text/csv")
 
 
-st.sidebar.title("設定")
-st.sidebar.button("重新載入資料（Google Drive）", on_click=_touch_reload_flag, args=("gdrive",))
-st.sidebar.button("重新載入資料（OneDrive）", on_click=_touch_reload_flag, args=("onedrive",))
-st.sidebar.caption(f"Google Drive：{'已設定' if (st.secrets.get('GOOGLE_SHEETS_URL') or st.secrets.get('GDRIVE_FILE_URL')) else '未設定'}")
-st.sidebar.caption(f"OneDrive：{'已設定' if st.secrets.get('ONEDRIVE_XLSX_URL') else '未設定'}")
-
-if is_admin():
-    st.sidebar.markdown("### 管理者操作")
-    st.sidebar.info("上傳後會覆蓋 data/family_data.xlsx（只有你能做這件事）")
-    uploaded = st.sidebar.file_uploader("上傳新版 Excel (.xlsx)", type=["xlsx"])
-    if uploaded is not None:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        XLSX_PATH.write_bytes(uploaded.getbuffer())
-        st.sidebar.success("已更新 Excel！請重新整理頁面。")
-        st.cache_data.clear()
-
 st.title("Richard 的投資儀表板")
 if XLSX_PATH.exists():
     st.caption(f"資料最後更新時間：{pd.to_datetime(XLSX_PATH.stat().st_mtime, unit='s')}")
@@ -629,29 +590,16 @@ if XLSX_PATH.exists():
 
 # 嘗試自動同步：首次沒有檔案，或按了「重新載入資料」才會從 OneDrive 抓
 # 嘗試自動同步：首次沒有檔案，或按了「重新載入」才會從雲端抓（Google Drive 優先，其次 OneDrive）
-source = st.session_state.pop("_reload_source", None)
-need_fetch = (not XLSX_PATH.exists()) or (source in ("gdrive", "onedrive"))
-if need_fetch:
+# 首次沒有檔案時，才嘗試從雲端抓一次（不顯示左側設定按鈕）
+if not XLSX_PATH.exists():
     fetched = False
-    # 1) 指定來源
-    if source == "gdrive":
+    if st.secrets.get("GOOGLE_SHEETS_URL") or st.secrets.get("GDRIVE_FILE_URL"):
         fetched = ensure_excel_from_gdrive(XLSX_PATH)
-        if (not fetched) and st.secrets.get("ONEDRIVE_XLSX_URL"):
-            fetched = ensure_excel_from_onedrive(XLSX_PATH)
-    elif source == "onedrive":
+    if (not fetched) and st.secrets.get("ONEDRIVE_XLSX_URL"):
         fetched = ensure_excel_from_onedrive(XLSX_PATH)
-        if (not fetched) and (st.secrets.get("GOOGLE_SHEETS_URL") or st.secrets.get("GDRIVE_FILE_URL")):
-            fetched = ensure_excel_from_gdrive(XLSX_PATH)
-    else:
-        # 2) 未指定：有設定 Google Drive 就先試，失敗再試 OneDrive
-        if st.secrets.get("GOOGLE_SHEETS_URL") or st.secrets.get("GDRIVE_FILE_URL"):
-            fetched = ensure_excel_from_gdrive(XLSX_PATH)
-        if (not fetched) and st.secrets.get("ONEDRIVE_XLSX_URL"):
-            fetched = ensure_excel_from_onedrive(XLSX_PATH)
 
     if fetched:
         st.cache_data.clear()
-
 if not XLSX_PATH.exists():
     st.error("找不到 data/family_data.xlsx。請由管理者登入後上傳 Excel。")
     st.stop()
