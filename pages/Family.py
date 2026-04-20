@@ -7,7 +7,6 @@ from pathlib import Path
 import numpy as np
 import datetime
 import re
-from openpyxl import load_workbook
 #import time
 #BUILD_TAG = "re-import-fix-" + str(int(time.time()))
 
@@ -131,7 +130,13 @@ def _touch_reload_flag(source: str):
     st.session_state["_reload_source"] = source
 
 
-DATA_DIR = Path(__file__).parent / "data"
+BASE_DIR = Path(__file__).resolve().parent
+if (BASE_DIR / "data").exists():
+    DATA_DIR = BASE_DIR / "data"
+elif (BASE_DIR.parent / "data").exists():
+    DATA_DIR = BASE_DIR.parent / "data"
+else:
+    DATA_DIR = BASE_DIR / "data"
 XLSX_PATH = DATA_DIR / "family_data.xlsx"
 
 # ====== 管理者驗證（用 Streamlit Secrets：ADMIN_PASSWORD）======
@@ -254,6 +259,8 @@ def extract_allocation_from_analysis_block(Family: pd.DataFrame):
 def extract_allocation_from_analysis_sheet(xlsx_path: Path, sheet_name: str = "Family"):
     """
     直接從 Excel 工作表讀『分析』區塊，避免 DataFrame 因合併儲存格/空白欄位而錯位。
+    這一版會以 Excel 原始座標找：分析 / 分類 / 參考現值，
+    因此能正確抓到台幣活儲、台股、台股 ETF、美股、美金儲蓄等列。
     """
     if not xlsx_path.exists():
         return None
@@ -281,7 +288,6 @@ def extract_allocation_from_analysis_sheet(xlsx_path: Path, sheet_name: str = "F
                 break
         if anchor:
             break
-
     if not anchor:
         return None
 
@@ -336,12 +342,15 @@ def extract_allocation_from_analysis_sheet(xlsx_path: Path, sheet_name: str = "F
 
 
 def make_allocation_pie_from_analysis(Family: pd.DataFrame, xlsx_path: Path | None = None):
+    # 優先用 Excel 原始工作表解析，避免與『分析』區塊顯示不一致
     alloc = None
     if xlsx_path is not None:
         alloc = extract_allocation_from_analysis_sheet(xlsx_path, sheet_name="Family")
 
+    # 若工作表解析失敗，再退回 DataFrame 版本
     if alloc is None or alloc.empty:
         alloc = extract_allocation_from_analysis_block(Family)
+
     if alloc is None or alloc.empty:
         return None
 
@@ -573,9 +582,10 @@ def make_yearly_return_combo(Family: pd.DataFrame, mode: str = "已實現", attr
     折線：累積收益（含數字標籤）
 
     穩定版修正：
-    - 過濾異常年份（避免 2099 / 2100 類錯誤日期把圖拉爆）
+    - 過濾異常年份（避免 2099 / 2100 之類錯誤日期把圖拉爆）
     - X 軸使用類別軸，只顯示實際存在的年度
     - C 模式跨年度攤提時限制在合理年份範圍內
+    - 若資料只剩單一年度，也能正常顯示
     """
     realized_col = "已實現損益"
     unrealized_col = "未實現損益"
@@ -596,11 +606,13 @@ def make_yearly_return_combo(Family: pd.DataFrame, mode: str = "已實現", attr
         y = pd.to_numeric(s, errors="coerce")
         return y.where((y >= MIN_YEAR) & (y <= MAX_YEAR))
 
+    # 日期欄位轉換
     if buy_date_col is not None:
         df[buy_date_col] = pd.to_datetime(df[buy_date_col], errors="coerce")
     if sell_date_col is not None:
         df[sell_date_col] = pd.to_datetime(df[sell_date_col], errors="coerce")
 
+    # 只計入有賣出日的「已實現」列
     sold = df.copy()
     if sell_date_col is not None:
         sold = sold[sold[sell_date_col].notna()].copy()
@@ -645,11 +657,13 @@ def make_yearly_return_combo(Family: pd.DataFrame, mode: str = "已實現", attr
                 b = pd.Timestamp(b).normalize()
                 s = pd.Timestamp(s).normalize()
 
+                # 只保留合理年份資料；異常未來年份直接裁切到當年
                 if b.year < MIN_YEAR:
                     b = pd.Timestamp(f"{MIN_YEAR}-01-01")
                 if s.year > MAX_YEAR:
                     s = pd.Timestamp(f"{MAX_YEAR}-12-31")
 
+                # 若裁切後仍異常，跳過
                 if s.year < MIN_YEAR or b.year > MAX_YEAR:
                     continue
 
@@ -712,8 +726,10 @@ def make_yearly_return_combo(Family: pd.DataFrame, mode: str = "已實現", attr
     if yearly.empty:
         return None
 
+    # 合併同年度、排序、轉 int，確保 X 軸只顯示真實年度
     yearly = yearly.groupby("年度", as_index=False)["年度收益"].sum().sort_values("年度")
     yearly["年度"] = yearly["年度"].astype(int)
+
     yearly["累積收益"] = yearly["年度收益"].cumsum()
     yearly["累積標籤"] = yearly["累積收益"].map(lambda v: f"{v:,.0f}")
     yearly["年度標籤"] = yearly["年度收益"].map(lambda v: f"{v:,.0f}")
@@ -771,7 +787,7 @@ def make_yearly_return_combo(Family: pd.DataFrame, mode: str = "已實現", attr
 
 
 # ====== 側邊欄：管理者上傳（只有輸入密碼才會出現） ======
-view_mode = st.radio("顯示內容", ["圖表", "交易明細"], index=0, horizontal=True)
+view_mode = st.sidebar.radio("顯示內容", ["圖表", "交易明細"], index=0)
 #st.sidebar.caption(f"BUILD_TAG: {BUILD_TAG}")
 
 
@@ -827,10 +843,25 @@ def render_trade_details(Family: pd.DataFrame):
     st.download_button("下載明細 CSV", data=csv, file_name="trades.csv", mime="text/csv")
 
 
+st.sidebar.title("設定")
+st.sidebar.button("重新載入資料（Google Drive）", on_click=_touch_reload_flag, args=("gdrive",))
+st.sidebar.button("重新載入資料（OneDrive）", on_click=_touch_reload_flag, args=("onedrive",))
+st.sidebar.caption(f"Google Drive：{'已設定' if (safe_secret('GOOGLE_SHEETS_URL') or safe_secret('GDRIVE_FILE_URL')) else '未設定'}")
+st.sidebar.caption(f"OneDrive：{'已設定' if safe_secret('ONEDRIVE_XLSX_URL') else '未設定'}")
+
+if is_admin():
+    st.sidebar.markdown("### 管理者操作")
+    st.sidebar.info("上傳後會覆蓋 data/family_data.xlsx（只有你能做這件事）")
+    uploaded = st.sidebar.file_uploader("上傳新版 Excel (.xlsx)", type=["xlsx"])
+    if uploaded is not None:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        XLSX_PATH.write_bytes(uploaded.getbuffer())
+        st.sidebar.success("已更新 Excel！請重新整理頁面。")
+        st.cache_data.clear()
 
 st.title("Family 的投資儀表板")
 if XLSX_PATH.exists():
-    st.caption(f"資料最後更新時間：{pd.to_datetime(XLSX_PATH.stat().st_mtime, unit='s').strftime('%Y-%m-%d %H:%M:%S')}")
+    st.caption(f"資料最後更新時間：{pd.to_datetime(XLSX_PATH.stat().st_mtime, unit='s')}")
 
 
 
@@ -843,17 +874,17 @@ if need_fetch:
     # 1) 指定來源
     if source == "gdrive":
         fetched = ensure_excel_from_gdrive(XLSX_PATH)
-        if (not fetched) and safe_secret("ONEDRIVE_XLSX_URL"):
+        if (not fetched) and st.secrets.get("ONEDRIVE_XLSX_URL"):
             fetched = ensure_excel_from_onedrive(XLSX_PATH)
     elif source == "onedrive":
         fetched = ensure_excel_from_onedrive(XLSX_PATH)
-        if (not fetched) and (safe_secret("GOOGLE_SHEETS_URL") or safe_secret("GDRIVE_FILE_URL")):
+        if (not fetched) and (st.secrets.get("GOOGLE_SHEETS_URL") or st.secrets.get("GDRIVE_FILE_URL")):
             fetched = ensure_excel_from_gdrive(XLSX_PATH)
     else:
         # 2) 未指定：有設定 Google Drive 就先試，失敗再試 OneDrive
-        if safe_secret("GOOGLE_SHEETS_URL") or safe_secret("GDRIVE_FILE_URL"):
+        if st.secrets.get("GOOGLE_SHEETS_URL") or st.secrets.get("GDRIVE_FILE_URL"):
             fetched = ensure_excel_from_gdrive(XLSX_PATH)
-        if (not fetched) and safe_secret("ONEDRIVE_XLSX_URL"):
+        if (not fetched) and st.secrets.get("ONEDRIVE_XLSX_URL"):
             fetched = ensure_excel_from_onedrive(XLSX_PATH)
 
 if not XLSX_PATH.exists():
