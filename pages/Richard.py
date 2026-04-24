@@ -230,6 +230,62 @@ def make_allocation_pie_from_analysis(richard: pd.DataFrame):
     fig.update_layout(height=520)
     return fig
 
+
+def make_holding_distribution_pie(richard: pd.DataFrame):
+    """
+    持股分布圓餅圖：
+    - 依 Excel 交易明細的「參考現值」欄位計算
+    - 以「股票名稱」彙總，同一檔股票多筆買進會合併
+    - 只納入參考現值 > 0 的持股，避免已賣出或空白列被算入
+    """
+    value_col = "參考現值"
+    code_col = "股票代號" if "股票代號" in richard.columns else None
+    name_col = "股票名稱" if "股票名稱" in richard.columns else ("股票" if "股票" in richard.columns else None)
+
+    if value_col not in richard.columns or name_col is None:
+        return None
+
+    df = _filter_trade_like_rows(richard).copy()
+    df[value_col] = to_num(df[value_col])
+    df = df[df[value_col] > 0]
+
+    if df.empty:
+        return None
+
+    df[name_col] = df[name_col].astype(str).str.strip()
+    df = df[(df[name_col] != "") & (df[name_col].str.lower() != "nan")]
+
+    # 顯示名稱：有股票代號就用「代號 名稱」，避免同名或 ETF 名稱不清楚
+    if code_col is not None:
+        df[code_col] = df[code_col].astype(str).str.strip()
+        df["持股"] = np.where(
+            (df[code_col] != "") & (df[code_col].str.lower() != "nan"),
+            df[code_col] + " " + df[name_col],
+            df[name_col]
+        )
+    else:
+        df["持股"] = df[name_col]
+
+    agg = (
+        df.groupby("持股", dropna=True)[value_col]
+          .sum()
+          .reset_index()
+          .sort_values(value_col, ascending=False)
+    )
+
+    if agg.empty:
+        return None
+
+    fig = px.pie(
+        agg,
+        names="持股",
+        values=value_col,
+        title="持股分布（依參考現值）",
+    )
+    fig.update_traces(textposition="inside", textinfo="percent+label")
+    fig.update_layout(height=520)
+    return fig
+
 def _filter_trade_like_rows(df: pd.DataFrame) -> pd.DataFrame:
     """
     避免把 Excel 底部『分析/總計』等彙總區塊算進交易/持股。
@@ -618,7 +674,7 @@ c5.metric("報酬率", f"{ret*100:,.2f}%")
 st.divider()
 
 if view_mode == "圖表":
-    # ====== 圖表順序（由上至下）：投資收益、資產配置、台幣現金水位圖、台股Top10、美股Top10 ======
+    # ====== 圖表順序（由上至下）：投資收益、資產配置、持股分布、台幣現金水位圖、台股Top10、美股Top10 ======
     mode = st.radio("年度收益模式", ["已實現", "含未實現"], horizontal=True)
 
     yearly_fig = make_yearly_return_combo(richard, mode=mode)
@@ -632,6 +688,12 @@ if view_mode == "圖表":
         st.plotly_chart(pie, use_container_width=True)
     else:
         st.warning("找不到 Excel 內『分析』區塊（含『分類』與『參考現值』）或該區塊資料為空。")
+
+    holding_pie = make_holding_distribution_pie(richard)
+    if holding_pie is not None:
+        st.plotly_chart(holding_pie, use_container_width=True)
+    else:
+        st.warning("找不到可用的『參考現值』持股資料，無法產生持股分布圖。")
 
     ts = make_timeseries(acct)
     if ts is not None:
