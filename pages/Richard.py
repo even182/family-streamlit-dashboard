@@ -231,14 +231,16 @@ def make_allocation_pie_from_analysis(richard: pd.DataFrame):
     return fig
 
 
-def make_holding_distribution_pie(richard: pd.DataFrame):
+def make_holding_distribution_pie(richard: pd.DataFrame, market: str | None = None):
     """
     持股分布圓餅圖：
     - 依 Excel 交易明細的「參考現值」欄位計算
-    - 以「股票名稱」彙總，同一檔股票多筆買進會合併
+    - 以「股票代號 + 股票名稱」彙總，同一檔股票多筆買進會合併
     - 只納入參考現值 > 0 的持股，避免已賣出或空白列被算入
+    - market=None：全部持股；market="台股"：台股 + 台股 ETF；market="美股"：美股
     """
     value_col = "參考現值"
+    cat_col = "分類"
     code_col = "股票代號" if "股票代號" in richard.columns else None
     name_col = "股票名稱" if "股票名稱" in richard.columns else ("股票" if "股票" in richard.columns else None)
 
@@ -246,6 +248,19 @@ def make_holding_distribution_pie(richard: pd.DataFrame):
         return None
 
     df = _filter_trade_like_rows(richard).copy()
+
+    # 依分類切出台股 / 美股，避免台股與美股混在同一張圖
+    if market is not None:
+        if cat_col not in df.columns:
+            return None
+        cat = df[cat_col].astype(str).str.strip()
+        if market == "台股":
+            df = df[cat.isin(["台股", "台股 ETF"])]
+        elif market == "美股":
+            df = df[cat == "美股"]
+        else:
+            return None
+
     df[value_col] = to_num(df[value_col])
     df = df[df[value_col] > 0]
 
@@ -276,11 +291,12 @@ def make_holding_distribution_pie(richard: pd.DataFrame):
     if agg.empty:
         return None
 
+    title = "持股分布（依參考現值）" if market is None else f"持股分布（{market}，依參考現值）"
     fig = px.pie(
         agg,
         names="持股",
         values=value_col,
-        title="持股分布（依參考現值）",
+        title=title,
     )
     fig.update_traces(textposition="inside", textinfo="percent+label")
     fig.update_layout(height=520)
@@ -689,11 +705,23 @@ if view_mode == "圖表":
     else:
         st.warning("找不到 Excel 內『分析』區塊（含『分類』與『參考現值』）或該區塊資料為空。")
 
-    holding_pie = make_holding_distribution_pie(richard)
-    if holding_pie is not None:
-        st.plotly_chart(holding_pie, use_container_width=True)
-    else:
-        st.warning("找不到可用的『參考現值』持股資料，無法產生持股分布圖。")
+    # ====== 持股分布（台股 / 美股分開） ======
+    st.subheader("持股分布")
+    hold_col1, hold_col2 = st.columns(2)
+
+    with hold_col1:
+        holding_pie_tw = make_holding_distribution_pie(richard, market="台股")
+        if holding_pie_tw is not None:
+            st.plotly_chart(holding_pie_tw, use_container_width=True)
+        else:
+            st.info("沒有找到可用的台股『參考現值』持股資料。")
+
+    with hold_col2:
+        holding_pie_us = make_holding_distribution_pie(richard, market="美股")
+        if holding_pie_us is not None:
+            st.plotly_chart(holding_pie_us, use_container_width=True)
+        else:
+            st.info("沒有找到可用的美股『參考現值』持股資料。")
 
     ts = make_timeseries(acct)
     if ts is not None:
