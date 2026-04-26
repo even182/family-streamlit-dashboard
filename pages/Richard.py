@@ -136,6 +136,172 @@ def to_num(s: pd.Series) -> pd.Series:
 
 
 
+
+
+# ====== 進階績效：IRR / 資金使用率 / 10年預測 ======
+def _first_existing_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    return next((c for c in candidates if c in df.columns), None)
+
+
+def _xnpv(rate: float, cashflows: list[tuple[pd.Timestamp, float]]) -> float:
+    if not cashflows:
+        return 0.0
+    d0 = min(d for d, _ in cashflows)
+    total = 0.0
+    for d, cf in cashflows:
+        days = (d - d0).days
+        total += cf / ((1.0 + rate) ** (days / 365.0))
+    return total
+
+
+def calc_xirr(cashflows: list[tuple[pd.Timestamp, float]]) -> float | None:
+    """用日期現金流估算 XIRR。需同時有正、負現金流。"""
+    cfs = [(pd.to_datetime(d), float(v)) for d, v in cashflows if pd.notna(d) and abs(float(v)) > 1e-9]
+    if not cfs or not any(v > 0 for _, v in cfs) or not any(v < 0 for _, v in cfs):
+        return None
+
+    # 先用多組區間尋找符號反轉，再二分法；避免 numpy_financial 相依性
+    grid = [-0.999, -0.9, -0.75, -0.5, -0.25, -0.1, 0.0, 0.05, 0.1, 0.2, 0.4, 0.7, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0]
+    vals = []
+    for r in grid:
+        try:
+            v = _xnpv(r, cfs)
+            if np.isfinite(v):
+                vals.append((r, v))
+        except Exception:
+            pass
+
+    for (lo, vlo), (hi, vhi) in zip(vals, vals[1:]):
+        if vlo == 0:
+            return lo
+        if vlo * vhi > 0:
+            continue
+        for _ in range(100):
+            mid = (lo + hi) / 2
+            vmid = _xnpv(mid, cfs)
+            if abs(vmid) < 1e-5:
+                return mid
+            if vlo * vmid <= 0:
+                hi, vhi = mid, vmid
+            else:
+                lo, vlo = mid, vmid
+        return (lo + hi) / 2
+    return None
+
+
+def build_investment_cashflows(richard: pd.DataFrame) -> list[tuple[pd.Timestamp, float]]:
+    """
+    以交易明細估算 IRR：
+    - 買進日：成交金額視為現金流出
+    - 賣出日：成交金額 + 已實現損益 + 除息 視為現金流入
+    - 未賣出部位：今天以參考現值 + 除息 當作期末價值
+    """
+    df = _filter_trade_like_rows(richard).copy()
+    if "分類" in df.columns:
+        cat = df["分類"].astype(str).str.strip()
+        df = df[cat.notna() & (cat != "") & (cat.str.lower() != "nan")]
+
+    buy_date_col = _first_existing_col(df, ["買進日期", "日期"])
+    sell_date_col = _first_existing_col(df, ["賣出日期", "出場日期"])
+    amount_col = _first_existing_col(df, ["成交金額", "投入金額", "買進金額"])
+    realized_col = _first_existing_col(df, ["已實現損益"])
+    value_col = _first_existing_col(df, ["參考現值", "市值"])
+    dividend_col = _first_existing_col(df, ["除息", "股息", "配息"])
+
+    if buy_date_col is None or amount_col is None:
+        return []
+
+    today = pd.Timestamp.today().normalize()
+    cashflows: list[tuple[pd.Timestamp, float]] = []
+    for _, row in df.iterrows():
+        buy_date = pd.to_datetime(row.get(buy_date_col), errors="coerce")
+        amount = pd.to_numeric(str(row.get(amount_col, 0)).replace(",", ""), errors="coerce")
+        if pd.notna(buy_date) and pd.notna(amount) and amount > 0:
+            cashflows.append((buy_date, -float(amount)))
+
+        div = pd.to_numeric(str(row.get(dividend_col, 0)).replace(",", ""), errors="coerce") if dividend_col else 0.0
+        div = 0.0 if pd.isna(div) else float(div)
+
+        sell_date = pd.to_datetime(row.get(sell_date_col), errors="coerce") if sell_date_col else pd.NaT
+        if pd.notna(sell_date):
+            realized = pd.to_numeric(str(row.get(realized_col, 0)).replace(",", ""), errors="coerce") if realized_col else 0.0
+            realized = 0.0 if pd.isna(realized) else float(realized)
+            cashflows.append((sell_date, float(amount) + realized + div))
+        else:
+            value = pd.to_numeric(str(row.get(value_col, 0)).replace(",", ""), errors="coerce") if value_col else 0.0
+            value = 0.0 if pd.isna(value) else float(value)
+            if value > 0 or div > 0:
+                cashflows.append((today, value + div))
+    return cashflows
+
+
+def compute_advanced_metrics(richard: pd.DataFrame, acct: pd.DataFrame):
+    total_invested, total_realized, total_unrealized, total_pnl, simple_ret = compute_kpi(richard)
+
+    df = _filter_trade_like_rows(richard).copy()
+    if "分類" in df.columns:
+        cat = df["分類"].astype(str).str.strip()
+        df = df[cat.notna() & (cat != "") & (cat.str.lower() != "nan")]
+
+    value_col = _first_existing_col(df, ["參考現值", "市值"])
+    current_invested_value = float(to_num(df[value_col]).sum()) if value_col else max(total_invested + total_unrealized, 0.0)
+
+    cash_candidates = ["台幣現金水位", "台幣現金", "現金水位", "台幣結餘", "結餘"]
+    date_col = "日期" if "日期" in acct.columns else acct.columns[0]
+    acct2 = acct.copy()
+    acct2[date_col] = pd.to_datetime(acct2[date_col], errors="coerce")
+    acct2 = acct2.dropna(subset=[date_col]).sort_values(date_col)
+    cash_col = _first_existing_col(acct2, cash_candidates)
+    cash_balance = 0.0
+    if cash_col and not acct2.empty:
+        cash_balance = float(to_num(acct2[cash_col]).iloc[-1])
+
+    total_assets = current_invested_value + cash_balance
+    capital_base = total_invested + cash_balance
+    capital_usage = current_invested_value / total_assets if total_assets > 0 else 0.0
+    total_asset_growth = (total_assets / capital_base - 1) if capital_base > 0 else 0.0
+
+    cfs = build_investment_cashflows(richard)
+    irr = calc_xirr(cfs)
+
+    return {
+        "irr": irr,
+        "current_invested_value": current_invested_value,
+        "cash_balance": cash_balance,
+        "total_assets": total_assets,
+        "capital_usage": capital_usage,
+        "total_asset_growth": total_asset_growth,
+        "simple_ret": simple_ret,
+    }
+
+
+def make_10y_projection_chart(start_assets: float, base_rate: float | None, annual_add: float = 0.0):
+    if start_assets <= 0:
+        return None
+    if base_rate is None or not np.isfinite(base_rate):
+        base_rate = 0.08
+
+    scenarios = {
+        "保守 5%": 0.05,
+        f"基準 {base_rate*100:.1f}%": base_rate,
+        "樂觀 12%": 0.12,
+    }
+    rows = []
+    for name, r in scenarios.items():
+        value = start_assets
+        for y in range(0, 11):
+            if y == 0:
+                value = start_assets
+            else:
+                value = value * (1 + r) + annual_add
+            rows.append({"年度": y, "情境": name, "預測資產": value})
+    dfp = pd.DataFrame(rows)
+    fig = px.line(dfp, x="年度", y="預測資產", color="情境", markers=True, title="10年資產預測")
+    fig.update_layout(height=520, yaxis_title="資產金額", legend_title_text="")
+    fig.update_yaxes(tickformat=",")
+    return fig
+
+
 # ====== 資產配置（移植自 app01：更穩定的『分析』區塊解析） ======
 def _clean_text(x) -> str:
     if x is None or (isinstance(x, float) and np.isnan(x)):
@@ -680,6 +846,8 @@ richard, acct = load_data(XLSX_PATH, XLSX_PATH.stat().st_mtime)
 
 # ====== KPI ======
 total_invested, total_realized, total_unrealized, total_pnl, ret = compute_kpi(richard)
+adv = compute_advanced_metrics(richard, acct)
+
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("投入金額", f"{total_invested:,.0f}")
 c2.metric("已實現損益", f"{total_realized:,.0f}")
@@ -687,6 +855,15 @@ c3.metric("未實現損益", f"{total_unrealized:,.0f}")
 c4.metric("總損益", f"{total_pnl:,.0f}")
 c5.metric("報酬率", f"{ret*100:,.2f}%")
 
+c6, c7, c8, c9, c10 = st.columns(5)
+irr_text = "資料不足" if adv["irr"] is None else f"{adv['irr']*100:,.2f}%"
+c6.metric("年化報酬率 IRR", irr_text)
+c7.metric("總資產", f"{adv['total_assets']:,.0f}")
+c8.metric("總資產成長率", f"{adv['total_asset_growth']*100:,.2f}%")
+c9.metric("資金使用率", f"{adv['capital_usage']*100:,.2f}%")
+c10.metric("現金水位", f"{adv['cash_balance']:,.0f}")
+
+st.caption("註：IRR 以買進日、賣出日、參考現值估算；未賣出部位以今天參考現值作為期末價值。")
 st.divider()
 
 if view_mode == "圖表":
@@ -698,6 +875,15 @@ if view_mode == "圖表":
         st.plotly_chart(yearly_fig, use_container_width=True)
     else:
         st.info("無法產生『投資收益（年度 vs 累積）』圖表（請確認 Excel 有『賣出日期 / 已實現損益』）。")
+
+    st.subheader("10年資產預測")
+    default_monthly = 0
+    monthly_add = st.number_input("每月新增投入金額（可自行調整）", min_value=0, value=default_monthly, step=1000)
+    proj_fig = make_10y_projection_chart(adv["total_assets"], adv["irr"], annual_add=monthly_add * 12)
+    if proj_fig is not None:
+        st.plotly_chart(proj_fig, use_container_width=True)
+    else:
+        st.info("總資產資料不足，無法產生 10 年資產預測。")
 
     pie = make_allocation_pie_from_analysis(richard)
     if pie is not None:
