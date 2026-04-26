@@ -257,34 +257,68 @@ def compute_advanced_metrics(richard: pd.DataFrame, acct: pd.DataFrame):
         cash_balance = float(to_num(acct2[cash_col]).iloc[-1])
 
     total_assets = current_invested_value + cash_balance
-    capital_base = total_invested + cash_balance
+
+    # ===== 總資產成長率：改用「初始資金」為基準 =====
+    # 優先使用帳戶紀錄最早一筆「台幣本金」；若沒有，才退回最早現金水位。
+    # 注意：若中途有追加/提領本金，單純總資產成長率仍會被入出金影響；IRR 會更適合評估績效。
+    principal_candidates = ["台幣本金", "TWD本金", "本金(台幣)", "初始資金", "本金"]
+    principal_col = _first_existing_col(acct2, principal_candidates)
+    initial_capital = 0.0
+    if not acct2.empty:
+        if principal_col:
+            initial_capital = float(to_num(acct2[principal_col]).iloc[0])
+        elif cash_col:
+            initial_capital = float(to_num(acct2[cash_col]).iloc[0])
+
+    # 若帳戶紀錄抓不到初始資金，保守退回「目前投入 + 現金」避免除以 0。
+    if initial_capital <= 0:
+        initial_capital = total_invested + cash_balance
+
     capital_usage = current_invested_value / total_assets if total_assets > 0 else 0.0
-    total_asset_growth = (total_assets / capital_base - 1) if capital_base > 0 else 0.0
+    total_asset_growth = (total_assets / initial_capital - 1) if initial_capital > 0 else 0.0
 
     cfs = build_investment_cashflows(richard)
     irr = calc_xirr(cfs)
+
+    # ===== 10年預測用：納入資金使用率後的有效年化報酬率 =====
+    # 投資部位用 IRR；現金部位目前先視為 0% 報酬。若未來要納入定存/貨幣基金，可在這裡加入 cash_rate。
+    investment_rate = irr if irr is not None and np.isfinite(irr) else 0.08
+    cash_rate = 0.00
+    effective_return_rate = investment_rate * capital_usage + cash_rate * (1 - capital_usage)
 
     return {
         "irr": irr,
         "current_invested_value": current_invested_value,
         "cash_balance": cash_balance,
         "total_assets": total_assets,
+        "initial_capital": initial_capital,
         "capital_usage": capital_usage,
         "total_asset_growth": total_asset_growth,
+        "effective_return_rate": effective_return_rate,
         "simple_ret": simple_ret,
     }
 
 
-def make_10y_projection_chart(start_assets: float, base_rate: float | None, annual_add: float = 0.0):
+def make_10y_projection_chart(start_assets: float, effective_rate: float | None, annual_add: float = 0.0):
+    """
+    10年資產預測：
+    - 基準情境使用「有效年化報酬率」＝ 投資報酬率 × 資金使用率（現金部位預設 0%）
+    - 避免直接拿短期 IRR 全額複利，造成預測過度樂觀。
+    """
     if start_assets <= 0:
         return None
-    if base_rate is None or not np.isfinite(base_rate):
-        base_rate = 0.08
+    if effective_rate is None or not np.isfinite(effective_rate):
+        effective_rate = 0.08
+
+    # 以有效報酬率為中心，建立較合理的三情境
+    conservative_rate = max(effective_rate * 0.5, 0.03)
+    base_rate = effective_rate
+    optimistic_rate = min(effective_rate * 1.5, 0.15)
 
     scenarios = {
-        "保守 5%": 0.05,
-        f"基準 {base_rate*100:.1f}%": base_rate,
-        "樂觀 12%": 0.12,
+        f"保守 {conservative_rate*100:.1f}%": conservative_rate,
+        f"基準 {base_rate*100:.1f}%（含資金使用率）": base_rate,
+        f"樂觀 {optimistic_rate*100:.1f}%": optimistic_rate,
     }
     rows = []
     for name, r in scenarios.items():
@@ -296,7 +330,7 @@ def make_10y_projection_chart(start_assets: float, base_rate: float | None, annu
                 value = value * (1 + r) + annual_add
             rows.append({"年度": y, "情境": name, "預測資產": value})
     dfp = pd.DataFrame(rows)
-    fig = px.line(dfp, x="年度", y="預測資產", color="情境", markers=True, title="10年資產預測")
+    fig = px.line(dfp, x="年度", y="預測資產", color="情境", markers=True, title="10年資產預測（已納入資金使用率）")
     fig.update_layout(height=520, yaxis_title="資產金額", legend_title_text="")
     fig.update_yaxes(tickformat=",")
     return fig
@@ -863,7 +897,12 @@ c8.metric("總資產成長率", f"{adv['total_asset_growth']*100:,.2f}%")
 c9.metric("資金使用率", f"{adv['capital_usage']*100:,.2f}%")
 c10.metric("現金水位", f"{adv['cash_balance']:,.0f}")
 
-st.caption("註：IRR 以買進日、賣出日、參考現值估算；未賣出部位以今天參考現值作為期末價值。")
+c11, c12, c13 = st.columns(3)
+c11.metric("初始資金", f"{adv['initial_capital']:,.0f}")
+c12.metric("有效年化報酬率", f"{adv['effective_return_rate']*100:,.2f}%")
+c13.metric("投資部位現值", f"{adv['current_invested_value']:,.0f}")
+
+st.caption("註：總資產成長率以帳戶紀錄最早一筆初始資金為基準；10年預測使用『有效年化報酬率＝IRR × 資金使用率』（現金部位預設 0%）。")
 st.divider()
 
 if view_mode == "圖表":
@@ -879,7 +918,7 @@ if view_mode == "圖表":
     st.subheader("10年資產預測")
     default_monthly = 0
     monthly_add = st.number_input("每月新增投入金額（可自行調整）", min_value=0, value=default_monthly, step=1000)
-    proj_fig = make_10y_projection_chart(adv["total_assets"], adv["irr"], annual_add=monthly_add * 12)
+    proj_fig = make_10y_projection_chart(adv["total_assets"], adv["effective_return_rate"], annual_add=monthly_add * 12)
     if proj_fig is not None:
         st.plotly_chart(proj_fig, use_container_width=True)
     else:
