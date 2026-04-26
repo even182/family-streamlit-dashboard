@@ -351,6 +351,261 @@ def compute_kpi(family_df: pd.DataFrame):
     return total_invested, total_realized, total_unrealized, total_pnl, ret
 
 
+
+# ====== 進階績效：IRR / 資金使用率 / 10年預測 ======
+def _first_existing_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    return next((c for c in candidates if c in df.columns), None)
+
+
+def _xnpv(rate: float, cashflows: list[tuple[pd.Timestamp, float]]) -> float:
+    if not cashflows:
+        return 0.0
+    d0 = min(d for d, _ in cashflows)
+    total = 0.0
+    for d, cf in cashflows:
+        days = (d - d0).days
+        total += cf / ((1.0 + rate) ** (days / 365.0))
+    return total
+
+
+def calc_xirr(cashflows: list[tuple[pd.Timestamp, float]]) -> float | None:
+    """用日期現金流估算 XIRR。需同時有正、負現金流。"""
+    cfs = [(pd.to_datetime(d), float(v)) for d, v in cashflows if pd.notna(d) and abs(float(v)) > 1e-9]
+    if not cfs or not any(v > 0 for _, v in cfs) or not any(v < 0 for _, v in cfs):
+        return None
+
+    # 先用多組區間尋找符號反轉，再二分法；避免 numpy_financial 相依性
+    grid = [-0.999, -0.9, -0.75, -0.5, -0.25, -0.1, 0.0, 0.05, 0.1, 0.2, 0.4, 0.7, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0]
+    vals = []
+    for r in grid:
+        try:
+            v = _xnpv(r, cfs)
+            if np.isfinite(v):
+                vals.append((r, v))
+        except Exception:
+            pass
+
+    for (lo, vlo), (hi, vhi) in zip(vals, vals[1:]):
+        if vlo == 0:
+            return lo
+        if vlo * vhi > 0:
+            continue
+        for _ in range(100):
+            mid = (lo + hi) / 2
+            vmid = _xnpv(mid, cfs)
+            if abs(vmid) < 1e-5:
+                return mid
+            if vlo * vmid <= 0:
+                hi, vhi = mid, vmid
+            else:
+                lo, vlo = mid, vmid
+        return (lo + hi) / 2
+    return None
+
+
+def build_investment_cashflows(richard: pd.DataFrame) -> list[tuple[pd.Timestamp, float]]:
+    """
+    以交易明細估算 IRR：
+    - 買進日：成交金額視為現金流出
+    - 賣出日：成交金額 + 已實現損益 + 除息 視為現金流入
+    - 未賣出部位：今天以參考現值 + 除息 當作期末價值
+    """
+    df = _filter_trade_like_rows(richard).copy()
+    if "分類" in df.columns:
+        cat = df["分類"].astype(str).str.strip()
+        df = df[cat.notna() & (cat != "") & (cat.str.lower() != "nan")]
+
+    buy_date_col = _first_existing_col(df, ["買進日期", "日期"])
+    sell_date_col = _first_existing_col(df, ["賣出日期", "出場日期"])
+    amount_col = _first_existing_col(df, ["成交金額", "投入金額", "買進金額"])
+    realized_col = _first_existing_col(df, ["已實現損益"])
+    value_col = _first_existing_col(df, ["參考現值", "市值"])
+    dividend_col = _first_existing_col(df, ["除息", "股息", "配息"])
+
+    if buy_date_col is None or amount_col is None:
+        return []
+
+    today = pd.Timestamp.today().normalize()
+    cashflows: list[tuple[pd.Timestamp, float]] = []
+    for _, row in df.iterrows():
+        buy_date = pd.to_datetime(row.get(buy_date_col), errors="coerce")
+        amount = pd.to_numeric(str(row.get(amount_col, 0)).replace(",", ""), errors="coerce")
+        if pd.notna(buy_date) and pd.notna(amount) and amount > 0:
+            cashflows.append((buy_date, -float(amount)))
+
+        div = pd.to_numeric(str(row.get(dividend_col, 0)).replace(",", ""), errors="coerce") if dividend_col else 0.0
+        div = 0.0 if pd.isna(div) else float(div)
+
+        sell_date = pd.to_datetime(row.get(sell_date_col), errors="coerce") if sell_date_col else pd.NaT
+        if pd.notna(sell_date):
+            realized = pd.to_numeric(str(row.get(realized_col, 0)).replace(",", ""), errors="coerce") if realized_col else 0.0
+            realized = 0.0 if pd.isna(realized) else float(realized)
+            cashflows.append((sell_date, float(amount) + realized + div))
+        else:
+            value = pd.to_numeric(str(row.get(value_col, 0)).replace(",", ""), errors="coerce") if value_col else 0.0
+            value = 0.0 if pd.isna(value) else float(value)
+            if value > 0 or div > 0:
+                cashflows.append((today, value + div))
+    return cashflows
+
+
+def compute_advanced_metrics(richard: pd.DataFrame, acct: pd.DataFrame):
+    total_invested, total_realized, total_unrealized, total_pnl, simple_ret = compute_kpi(richard)
+
+    df = _filter_trade_like_rows(richard).copy()
+    if "分類" in df.columns:
+        cat = df["分類"].astype(str).str.strip()
+        df = df[cat.notna() & (cat != "") & (cat.str.lower() != "nan")]
+
+    value_col = _first_existing_col(df, ["參考現值", "市值"])
+    current_invested_value = float(to_num(df[value_col]).sum()) if value_col else max(total_invested + total_unrealized, 0.0)
+
+    cash_candidates = ["台幣現金水位", "台幣現金", "現金水位", "台幣結餘", "結餘"]
+    date_col = "日期" if "日期" in acct.columns else acct.columns[0]
+    acct2 = acct.copy()
+    acct2[date_col] = pd.to_datetime(acct2[date_col], errors="coerce")
+    acct2 = acct2.dropna(subset=[date_col]).sort_values(date_col)
+    cash_col = _first_existing_col(acct2, cash_candidates)
+    cash_balance = 0.0
+    if cash_col and not acct2.empty:
+        cash_balance = float(to_num(acct2[cash_col]).iloc[-1])
+
+    total_assets = current_invested_value + cash_balance
+
+    # ===== 資產績效：扣除後續新增本金，避免把「入金」誤當成「報酬」 =====
+    # 優先使用帳戶紀錄的「台幣本金」作為累積投入本金；若沒有，才退回「投入金額 + 現金」。
+    principal_candidates = ["台幣本金", "TWD本金", "本金(台幣)", "初始資金", "本金"]
+    principal_col = _first_existing_col(acct2, principal_candidates)
+
+    first_date = acct2[date_col].iloc[0] if not acct2.empty else pd.Timestamp.today().normalize()
+    last_date = acct2[date_col].iloc[-1] if not acct2.empty else pd.Timestamp.today().normalize()
+
+    initial_capital = 0.0
+    total_contribution = 0.0
+    if not acct2.empty:
+        if principal_col:
+            principal_series = to_num(acct2[principal_col])
+            initial_capital = float(principal_series.iloc[0])
+            total_contribution = float(principal_series.iloc[-1])
+        elif cash_col:
+            cash_series = to_num(acct2[cash_col])
+            initial_capital = float(cash_series.iloc[0])
+            total_contribution = total_invested + cash_balance
+
+    # 若帳戶紀錄抓不到本金，保守退回「目前投入 + 現金」避免除以 0。
+    if total_contribution <= 0:
+        total_contribution = total_invested + cash_balance
+    if initial_capital <= 0:
+        initial_capital = total_contribution
+
+    capital_usage = current_invested_value / total_assets if total_assets > 0 else 0.0
+
+    # 資產報酬率：用目前總資產扣掉累積本金，只看真正增值。
+    asset_gain = total_assets - total_contribution
+    asset_return = (asset_gain / total_contribution) if total_contribution > 0 else 0.0
+
+    # 年化資產報酬：用扣本金後的資產報酬做近似年化；若期間太短，避免失真就顯示 None。
+    years = max((last_date - first_date).days / 365.0, 0.0)
+    asset_cagr = None
+    if years >= 0.25 and total_contribution > 0 and total_assets > 0:
+        asset_cagr = (total_assets / total_contribution) ** (1 / years) - 1
+
+    cfs = build_investment_cashflows(richard)
+    irr = calc_xirr(cfs)
+
+    # ===== 10年預測用：納入資金使用率後的有效年化報酬率 =====
+    # 投資部位用 IRR；現金部位目前先視為 0% 報酬。若未來要納入定存/貨幣基金，可在這裡加入 cash_rate。
+    investment_rate = irr if irr is not None and np.isfinite(irr) else 0.08
+    cash_rate = 0.00
+    effective_return_rate = investment_rate * capital_usage + cash_rate * (1 - capital_usage)
+
+    # ===== 進階版 10年預測用：以「有效報酬 = IRR × 資金使用率」為來源，再做長期收斂 =====
+    # raw effective_return_rate 反映目前短期績效；projection_base_rate 是拿來做長期預測的動態基準。
+    # 預設用 0.5 收斂係數，避免短期績效直接外推 10 年造成過度樂觀。
+    projection_convergence = 0.50
+    projection_min_rate = 0.03
+    projection_max_rate = 0.15
+    projection_base_rate_raw = effective_return_rate * projection_convergence
+    projection_base_rate = min(max(projection_base_rate_raw, projection_min_rate), projection_max_rate)
+
+    # Alpha：投資 IRR 與整體資產年化報酬的落差，用來觀察資金使用效率是否拖累成果。
+    alpha = None
+    if irr is not None and asset_cagr is not None:
+        alpha = irr - asset_cagr
+
+    return {
+        "irr": irr,
+        "current_invested_value": current_invested_value,
+        "cash_balance": cash_balance,
+        "total_assets": total_assets,
+        "initial_capital": initial_capital,
+        "total_contribution": total_contribution,
+        "asset_gain": asset_gain,
+        "asset_return": asset_return,
+        "asset_cagr": asset_cagr,
+        "capital_usage": capital_usage,
+        "effective_return_rate": effective_return_rate,
+        "projection_convergence": projection_convergence,
+        "projection_base_rate_raw": projection_base_rate_raw,
+        "projection_base_rate": projection_base_rate,
+        "projection_min_rate": projection_min_rate,
+        "projection_max_rate": projection_max_rate,
+        "alpha": alpha,
+        "simple_ret": simple_ret,
+    }
+
+def make_10y_projection_chart(
+    start_assets: float,
+    effective_rate: float | None,
+    annual_add: float = 0.0,
+    convergence: float = 0.50,
+    min_rate: float = 0.03,
+    max_rate: float = 0.15,
+):
+    """
+    進階版 10年資產預測：
+    - 來源：有效年化報酬率 = IRR × 資金使用率 + 現金報酬 × 現金比例。
+    - 長期預測基準：有效報酬 × 收斂係數，再套用上下限，避免短期 IRR 過度外推。
+    - 三情境：保守 / 基準 / 樂觀，皆由動態基準推導，不再是固定寫死。
+    """
+    if start_assets <= 0:
+        return None
+    if effective_rate is None or not np.isfinite(effective_rate):
+        effective_rate = 0.08
+
+    dynamic_base_raw = effective_rate * convergence
+    base_rate = min(max(dynamic_base_raw, min_rate), max_rate)
+    conservative_rate = min(max(base_rate * 0.70, min_rate), max_rate)
+    optimistic_rate = min(max(base_rate * 1.30, min_rate), max_rate)
+
+    scenarios = {
+        f"保守 {conservative_rate*100:.1f}%": conservative_rate,
+        f"基準 {base_rate*100:.1f}%（有效報酬×{convergence:.2f}）": base_rate,
+        f"樂觀 {optimistic_rate*100:.1f}%": optimistic_rate,
+    }
+    rows = []
+    for name, r in scenarios.items():
+        value = start_assets
+        for y in range(0, 11):
+            if y == 0:
+                value = start_assets
+            else:
+                value = value * (1 + r) + annual_add
+            rows.append({"年度": y, "情境": name, "預測資產": value})
+    dfp = pd.DataFrame(rows)
+    fig = px.line(
+        dfp,
+        x="年度",
+        y="預測資產",
+        color="情境",
+        markers=True,
+        title="10年資產預測（有效報酬動態基準 + 長期收斂）",
+    )
+    fig.update_layout(height=520, yaxis_title="資產金額", legend_title_text="")
+    fig.update_yaxes(tickformat=",")
+    return fig
+
+
 def make_rank_chart_by_market(family_df: pd.DataFrame, market: str, top_n: int = 10):
     realized_col = "已實現損益"
     unrealized_col = "未實現損益"
@@ -681,13 +936,43 @@ if XLSX_PATH.exists():
     st.caption(f"資料最後更新時間：{pd.to_datetime(XLSX_PATH.stat().st_mtime, unit='s')}")
 
 total_invested, total_realized, total_unrealized, total_pnl, ret = compute_kpi(family_df)
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("投入金額", f"{total_invested:,.0f}")
-c2.metric("已實現損益", f"{total_realized:,.0f}")
-c3.metric("未實現損益", f"{total_unrealized:,.0f}")
-c4.metric("總損益", f"{total_pnl:,.0f}")
-c5.metric("報酬率", f"{ret*100:,.2f}%")
+adv = compute_advanced_metrics(family_df, acct)
 
+# ====== KPI 說明小工具 ======
+# Streamlit 的 metric 支援 help 參數；滑鼠移到指標旁的 ? 可看到公式與用途。
+def kpi_metric(col, label: str, value: str, help_text: str):
+    try:
+        col.metric(label, value, help=help_text)
+    except TypeError:
+        # 舊版 Streamlit 若不支援 help，仍可正常顯示數值。
+        col.metric(label, value)
+
+alpha_text = "資料不足" if adv["alpha"] is None else f"{adv['alpha']*100:,.2f}%"
+irr_text = "資料不足" if adv["irr"] is None else f"{adv['irr']*100:,.2f}%"
+asset_cagr_text = "資料不足" if adv["asset_cagr"] is None else f"{adv['asset_cagr']*100:,.2f}%"
+
+c1, c2, c3, c4, c5 = st.columns(5)
+kpi_metric(c1, "投入金額", f"{total_invested:,.0f}", "交易明細中的累積成交金額。公式：Σ 成交金額。用途：作為投資部位的投入本金基準。")
+kpi_metric(c2, "已實現損益", f"{total_realized:,.0f}", "已賣出部位已經落袋的損益。公式：Σ 已實現損益。")
+kpi_metric(c3, "未實現損益", f"{total_unrealized:,.0f}", "尚未賣出部位依目前參考現值估算的浮動損益。公式：Σ 未實現損益。")
+kpi_metric(c4, "總損益", f"{total_pnl:,.0f}", "整體投資損益。公式：已實現損益 + 未實現損益。")
+kpi_metric(c5, "報酬率", f"{ret*100:,.2f}%", "投資部位的簡單報酬率，不含時間因素。公式：總損益 ÷ 投入金額。")
+
+c6, c7, c8, c9, c10 = st.columns(5)
+kpi_metric(c6, "年化報酬率 IRR", irr_text, "投資現金流的年化報酬率，考慮買進日、賣出日與未賣出部位參考現值。用途：衡量投資操作能力。")
+kpi_metric(c7, "總資產", f"{adv['total_assets']:,.0f}", "目前總資產。公式：投資部位現值 + 現金水位。")
+kpi_metric(c8, "年化資產報酬", asset_cagr_text, "整體財富的年化成長速度，已扣除累積本金影響。公式概念：(總資產 ÷ 累積本金)^(1/年數) - 1。用途：衡量真正變有錢的速度。")
+kpi_metric(c9, "資金使用率", f"{adv['capital_usage']*100:,.2f}%", "目前有多少資產實際投入市場。公式：投資部位現值 ÷ 總資產。")
+kpi_metric(c10, "現金水位", f"{adv['cash_balance']:,.0f}", "帳戶紀錄中最新一筆台幣現金水位。用途：評估可加碼資金與防守能力。")
+
+c11, c12, c13, c14, c15 = st.columns(5)
+kpi_metric(c11, "累積本金", f"{adv['total_contribution']:,.0f}", "目前用來衡量資產成長的本金基準。通常取帳戶紀錄中的資金累積值，避免把後續入金誤算成投資報酬。")
+kpi_metric(c12, "資產增值", f"{adv['asset_gain']:,.0f}", "扣除累積本金後真正增加的資產。公式：總資產 - 累積本金。")
+kpi_metric(c13, "資產報酬率", f"{adv['asset_return']*100:,.2f}%", "整體資產相對累積本金的累積報酬，不年化。公式：資產增值 ÷ 累積本金。")
+kpi_metric(c14, "有效年化報酬率", f"{adv['effective_return_rate']*100:,.2f}%", "把資金使用率納入後的投資效率。公式：IRR × 資金使用率。用途：避免只看投資部位 IRR 而忽略閒置現金。")
+kpi_metric(c15, "IRR-資產年化差", alpha_text, "投資部位年化報酬與整體資產年化報酬的差距。公式：IRR - 年化資產報酬。差距越大，通常代表現金閒置或資金配置效率仍有改善空間。")
+
+st.caption("註：滑鼠移到各項指標旁的說明圖示可查看公式與用途；10年預測來源為『有效年化報酬率 = IRR × 資金使用率』，再乘以收斂係數並套用上下限，避免短期 IRR 直接外推。")
 st.divider()
 
 
@@ -744,6 +1029,56 @@ if view_mode == "圖表":
         st.plotly_chart(yearly_fig, use_container_width=True)
     else:
         st.info("無法產生『投資收益（年度 vs 累積）』圖表（請確認 Excel 有『賣出日期 / 已實現損益』）。")
+
+    st.subheader("10年資產預測")
+    default_monthly = 0
+    monthly_add = st.number_input("每月新增投入金額（可自行調整）", min_value=0, value=default_monthly, step=1000)
+
+    with st.expander("進階預測參數（可調整預測基準）", expanded=False):
+        projection_convergence = st.slider(
+            "有效報酬收斂係數",
+            min_value=0.20,
+            max_value=1.00,
+            value=float(adv["projection_convergence"]),
+            step=0.05,
+            help="1.00 代表完全採用目前有效報酬；0.50 代表只採用一半，較適合長期預測。",
+        )
+        max_projection_rate_pct = st.slider(
+            "預測報酬率上限",
+            min_value=8.0,
+            max_value=25.0,
+            value=float(adv["projection_max_rate"] * 100),
+            step=0.5,
+            help="避免短期高 IRR 讓 10 年預測過度膨脹。",
+        )
+        min_projection_rate_pct = st.slider(
+            "預測報酬率下限",
+            min_value=0.0,
+            max_value=8.0,
+            value=float(adv["projection_min_rate"] * 100),
+            step=0.5,
+        )
+
+        preview_base_raw = adv["effective_return_rate"] * projection_convergence
+        preview_base = min(max(preview_base_raw, min_projection_rate_pct / 100), max_projection_rate_pct / 100)
+        st.write(
+            f"目前有效年化報酬率：{adv['effective_return_rate']*100:.2f}% → "
+            f"收斂後原始基準：{preview_base_raw*100:.2f}% → "
+            f"套用上下限後基準：{preview_base*100:.2f}%"
+        )
+
+    proj_fig = make_10y_projection_chart(
+        adv["total_assets"],
+        adv["effective_return_rate"],
+        annual_add=monthly_add * 12,
+        convergence=projection_convergence,
+        min_rate=min_projection_rate_pct / 100,
+        max_rate=max_projection_rate_pct / 100,
+    )
+    if proj_fig is not None:
+        st.plotly_chart(proj_fig, use_container_width=True)
+    else:
+        st.info("總資產資料不足，無法產生 10 年資產預測。")
 
     pie = make_allocation_pie_from_analysis(XLSX_PATH)
     if pie is not None:
