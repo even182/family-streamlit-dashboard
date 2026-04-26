@@ -305,8 +305,14 @@ def compute_advanced_metrics(richard: pd.DataFrame, acct: pd.DataFrame):
     cash_rate = 0.00
     effective_return_rate = investment_rate * capital_usage + cash_rate * (1 - capital_usage)
 
-    # 預測基準報酬率：避免短期 IRR 過度樂觀，基準最高先限制在 12%。
-    projection_base_rate = min(max(effective_return_rate, 0.03), 0.12)
+    # ===== 進階版 10年預測用：以「有效報酬 = IRR × 資金使用率」為來源，再做長期收斂 =====
+    # raw effective_return_rate 反映目前短期績效；projection_base_rate 是拿來做長期預測的動態基準。
+    # 預設用 0.5 收斂係數，避免短期績效直接外推 10 年造成過度樂觀。
+    projection_convergence = 0.50
+    projection_min_rate = 0.03
+    projection_max_rate = 0.15
+    projection_base_rate_raw = effective_return_rate * projection_convergence
+    projection_base_rate = min(max(projection_base_rate_raw, projection_min_rate), projection_max_rate)
 
     # Alpha：投資 IRR 與整體資產年化報酬的落差，用來觀察資金使用效率是否拖累成果。
     alpha = None
@@ -325,30 +331,42 @@ def compute_advanced_metrics(richard: pd.DataFrame, acct: pd.DataFrame):
         "asset_cagr": asset_cagr,
         "capital_usage": capital_usage,
         "effective_return_rate": effective_return_rate,
+        "projection_convergence": projection_convergence,
+        "projection_base_rate_raw": projection_base_rate_raw,
         "projection_base_rate": projection_base_rate,
+        "projection_min_rate": projection_min_rate,
+        "projection_max_rate": projection_max_rate,
         "alpha": alpha,
         "simple_ret": simple_ret,
     }
 
-def make_10y_projection_chart(start_assets: float, projection_rate: float | None, annual_add: float = 0.0):
+def make_10y_projection_chart(
+    start_assets: float,
+    effective_rate: float | None,
+    annual_add: float = 0.0,
+    convergence: float = 0.50,
+    min_rate: float = 0.03,
+    max_rate: float = 0.15,
+):
     """
-    10年資產預測：
-    - 基準情境使用「預測基準報酬率」：先納入資金使用率，再限制短期 IRR 過度外推。
-    - 避免直接拿短期 IRR 全額複利，造成預測過度樂觀。
+    進階版 10年資產預測：
+    - 來源：有效年化報酬率 = IRR × 資金使用率 + 現金報酬 × 現金比例。
+    - 長期預測基準：有效報酬 × 收斂係數，再套用上下限，避免短期 IRR 過度外推。
+    - 三情境：保守 / 基準 / 樂觀，皆由動態基準推導，不再是固定寫死。
     """
     if start_assets <= 0:
         return None
-    if projection_rate is None or not np.isfinite(projection_rate):
-        projection_rate = 0.08
+    if effective_rate is None or not np.isfinite(effective_rate):
+        effective_rate = 0.08
 
-    # 以預測基準報酬率為中心，建立較合理的三情境。
-    conservative_rate = max(projection_rate * 0.6, 0.03)
-    base_rate = projection_rate
-    optimistic_rate = min(projection_rate * 1.25, 0.15)
+    dynamic_base_raw = effective_rate * convergence
+    base_rate = min(max(dynamic_base_raw, min_rate), max_rate)
+    conservative_rate = min(max(base_rate * 0.70, min_rate), max_rate)
+    optimistic_rate = min(max(base_rate * 1.30, min_rate), max_rate)
 
     scenarios = {
         f"保守 {conservative_rate*100:.1f}%": conservative_rate,
-        f"基準 {base_rate*100:.1f}%（預測基準）": base_rate,
+        f"基準 {base_rate*100:.1f}%（有效報酬×{convergence:.2f}）": base_rate,
         f"樂觀 {optimistic_rate*100:.1f}%": optimistic_rate,
     }
     rows = []
@@ -361,7 +379,14 @@ def make_10y_projection_chart(start_assets: float, projection_rate: float | None
                 value = value * (1 + r) + annual_add
             rows.append({"年度": y, "情境": name, "預測資產": value})
     dfp = pd.DataFrame(rows)
-    fig = px.line(dfp, x="年度", y="預測資產", color="情境", markers=True, title="10年資產預測（扣本金績效 + 資金使用率基準）")
+    fig = px.line(
+        dfp,
+        x="年度",
+        y="預測資產",
+        color="情境",
+        markers=True,
+        title="10年資產預測（有效報酬動態基準 + 長期收斂）",
+    )
     fig.update_layout(height=520, yaxis_title="資產金額", legend_title_text="")
     fig.update_yaxes(tickformat=",")
     return fig
@@ -933,9 +958,17 @@ c11.metric("累積本金", f"{adv['total_contribution']:,.0f}")
 c12.metric("資產增值", f"{adv['asset_gain']:,.0f}")
 c13.metric("資產報酬率", f"{adv['asset_return']*100:,.2f}%")
 c14.metric("有效年化報酬率", f"{adv['effective_return_rate']*100:,.2f}%")
-c15.metric("預測基準報酬率", f"{adv['projection_base_rate']*100:,.2f}%")
+c15.metric("動態預測基準", f"{adv['projection_base_rate']*100:,.2f}%")
 
-st.caption("註：年化資產報酬與資產報酬率已扣除累積本金，避免把後續入金誤算成投資績效；10年預測使用『預測基準報酬率』，先納入資金使用率，再限制短期 IRR 過度外推。")
+c16, c17, c18, c19, c20 = st.columns(5)
+c16.metric("預測收斂係數", f"×{adv['projection_convergence']:.2f}")
+c17.metric("基準原始值", f"{adv['projection_base_rate_raw']*100:,.2f}%")
+c18.metric("預測下限", f"{adv['projection_min_rate']*100:,.2f}%")
+c19.metric("預測上限", f"{adv['projection_max_rate']*100:,.2f}%")
+alpha_text = "資料不足" if adv["alpha"] is None else f"{adv['alpha']*100:,.2f}%"
+c20.metric("IRR-資產年化差", alpha_text)
+
+st.caption("註：年化資產報酬與資產報酬率已扣除累積本金；10年預測來源為『有效年化報酬率 = IRR × 資金使用率』，再乘以收斂係數並套用上下限，避免短期 IRR 直接外推。")
 st.divider()
 
 if view_mode == "圖表":
@@ -951,7 +984,48 @@ if view_mode == "圖表":
     st.subheader("10年資產預測")
     default_monthly = 0
     monthly_add = st.number_input("每月新增投入金額（可自行調整）", min_value=0, value=default_monthly, step=1000)
-    proj_fig = make_10y_projection_chart(adv["total_assets"], adv["projection_base_rate"], annual_add=monthly_add * 12)
+
+    with st.expander("進階預測參數", expanded=False):
+        projection_convergence = st.slider(
+            "有效報酬收斂係數",
+            min_value=0.20,
+            max_value=1.00,
+            value=float(adv["projection_convergence"]),
+            step=0.05,
+            help="1.00 代表完全採用目前有效報酬；0.50 代表只採用一半，較適合長期預測。",
+        )
+        max_projection_rate_pct = st.slider(
+            "預測報酬率上限",
+            min_value=8.0,
+            max_value=25.0,
+            value=float(adv["projection_max_rate"] * 100),
+            step=0.5,
+            help="避免短期高 IRR 讓 10 年預測過度膨脹。",
+        )
+        min_projection_rate_pct = st.slider(
+            "預測報酬率下限",
+            min_value=0.0,
+            max_value=8.0,
+            value=float(adv["projection_min_rate"] * 100),
+            step=0.5,
+        )
+
+        preview_base_raw = adv["effective_return_rate"] * projection_convergence
+        preview_base = min(max(preview_base_raw, min_projection_rate_pct / 100), max_projection_rate_pct / 100)
+        st.write(
+            f"目前有效年化報酬率：{adv['effective_return_rate']*100:.2f}% → "
+            f"收斂後原始基準：{preview_base_raw*100:.2f}% → "
+            f"套用上下限後基準：{preview_base*100:.2f}%"
+        )
+
+    proj_fig = make_10y_projection_chart(
+        adv["total_assets"],
+        adv["effective_return_rate"],
+        annual_add=monthly_add * 12,
+        convergence=projection_convergence,
+        min_rate=min_projection_rate_pct / 100,
+        max_rate=max_projection_rate_pct / 100,
+    )
     if proj_fig is not None:
         st.plotly_chart(proj_fig, use_container_width=True)
     else:
