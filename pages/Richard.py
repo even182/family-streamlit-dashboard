@@ -937,38 +937,41 @@ richard, acct = load_data(XLSX_PATH, XLSX_PATH.stat().st_mtime)
 total_invested, total_realized, total_unrealized, total_pnl, ret = compute_kpi(richard)
 adv = compute_advanced_metrics(richard, acct)
 
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("投入金額", f"{total_invested:,.0f}")
-c2.metric("已實現損益", f"{total_realized:,.0f}")
-c3.metric("未實現損益", f"{total_unrealized:,.0f}")
-c4.metric("總損益", f"{total_pnl:,.0f}")
-c5.metric("報酬率", f"{ret*100:,.2f}%")
+# ====== KPI 說明小工具 ======
+# Streamlit 的 metric 支援 help 參數；滑鼠移到指標旁的 ? 可看到公式與用途。
+def kpi_metric(col, label: str, value: str, help_text: str):
+    try:
+        col.metric(label, value, help=help_text)
+    except TypeError:
+        # 舊版 Streamlit 若不支援 help，仍可正常顯示數值。
+        col.metric(label, value)
 
-c6, c7, c8, c9, c10 = st.columns(5)
+alpha_text = "資料不足" if adv["alpha"] is None else f"{adv['alpha']*100:,.2f}%"
 irr_text = "資料不足" if adv["irr"] is None else f"{adv['irr']*100:,.2f}%"
 asset_cagr_text = "資料不足" if adv["asset_cagr"] is None else f"{adv['asset_cagr']*100:,.2f}%"
-c6.metric("年化報酬率 IRR", irr_text)
-c7.metric("總資產", f"{adv['total_assets']:,.0f}")
-c8.metric("年化資產報酬", asset_cagr_text)
-c9.metric("資金使用率", f"{adv['capital_usage']*100:,.2f}%")
-c10.metric("現金水位", f"{adv['cash_balance']:,.0f}")
+
+c1, c2, c3, c4, c5 = st.columns(5)
+kpi_metric(c1, "投入金額", f"{total_invested:,.0f}", "交易明細中的累積成交金額。公式：Σ 成交金額。用途：作為投資部位的投入本金基準。")
+kpi_metric(c2, "已實現損益", f"{total_realized:,.0f}", "已賣出部位已經落袋的損益。公式：Σ 已實現損益。")
+kpi_metric(c3, "未實現損益", f"{total_unrealized:,.0f}", "尚未賣出部位依目前參考現值估算的浮動損益。公式：Σ 未實現損益。")
+kpi_metric(c4, "總損益", f"{total_pnl:,.0f}", "整體投資損益。公式：已實現損益 + 未實現損益。")
+kpi_metric(c5, "報酬率", f"{ret*100:,.2f}%", "投資部位的簡單報酬率，不含時間因素。公式：總損益 ÷ 投入金額。")
+
+c6, c7, c8, c9, c10 = st.columns(5)
+kpi_metric(c6, "年化報酬率 IRR", irr_text, "投資現金流的年化報酬率，考慮買進日、賣出日與未賣出部位參考現值。用途：衡量投資操作能力。")
+kpi_metric(c7, "總資產", f"{adv['total_assets']:,.0f}", "目前總資產。公式：投資部位現值 + 現金水位。")
+kpi_metric(c8, "年化資產報酬", asset_cagr_text, "整體財富的年化成長速度，已扣除累積本金影響。公式概念：(總資產 ÷ 累積本金)^(1/年數) - 1。用途：衡量真正變有錢的速度。")
+kpi_metric(c9, "資金使用率", f"{adv['capital_usage']*100:,.2f}%", "目前有多少資產實際投入市場。公式：投資部位現值 ÷ 總資產。")
+kpi_metric(c10, "現金水位", f"{adv['cash_balance']:,.0f}", "帳戶紀錄中最新一筆台幣現金水位。用途：評估可加碼資金與防守能力。")
 
 c11, c12, c13, c14, c15 = st.columns(5)
-c11.metric("累積本金", f"{adv['total_contribution']:,.0f}")
-c12.metric("資產增值", f"{adv['asset_gain']:,.0f}")
-c13.metric("資產報酬率", f"{adv['asset_return']*100:,.2f}%")
-c14.metric("有效年化報酬率", f"{adv['effective_return_rate']*100:,.2f}%")
-c15.metric("動態預測基準", f"{adv['projection_base_rate']*100:,.2f}%")
+kpi_metric(c11, "累積本金", f"{adv['total_contribution']:,.0f}", "目前用來衡量資產成長的本金基準。通常取帳戶紀錄中的資金累積值，避免把後續入金誤算成投資報酬。")
+kpi_metric(c12, "資產增值", f"{adv['asset_gain']:,.0f}", "扣除累積本金後真正增加的資產。公式：總資產 - 累積本金。")
+kpi_metric(c13, "資產報酬率", f"{adv['asset_return']*100:,.2f}%", "整體資產相對累積本金的累積報酬，不年化。公式：資產增值 ÷ 累積本金。")
+kpi_metric(c14, "有效年化報酬率", f"{adv['effective_return_rate']*100:,.2f}%", "把資金使用率納入後的投資效率。公式：IRR × 資金使用率。用途：避免只看投資部位 IRR 而忽略閒置現金。")
+kpi_metric(c15, "IRR-資產年化差", alpha_text, "投資部位年化報酬與整體資產年化報酬的差距。公式：IRR - 年化資產報酬。差距越大，通常代表現金閒置或資金配置效率仍有改善空間。")
 
-c16, c17, c18, c19, c20 = st.columns(5)
-c16.metric("預測收斂係數", f"×{adv['projection_convergence']:.2f}")
-c17.metric("基準原始值", f"{adv['projection_base_rate_raw']*100:,.2f}%")
-c18.metric("預測下限", f"{adv['projection_min_rate']*100:,.2f}%")
-c19.metric("預測上限", f"{adv['projection_max_rate']*100:,.2f}%")
-alpha_text = "資料不足" if adv["alpha"] is None else f"{adv['alpha']*100:,.2f}%"
-c20.metric("IRR-資產年化差", alpha_text)
-
-st.caption("註：年化資產報酬與資產報酬率已扣除累積本金；10年預測來源為『有效年化報酬率 = IRR × 資金使用率』，再乘以收斂係數並套用上下限，避免短期 IRR 直接外推。")
+st.caption("註：滑鼠移到各項指標旁的說明圖示可查看公式與用途；10年預測來源為『有效年化報酬率 = IRR × 資金使用率』，再乘以收斂係數並套用上下限，避免短期 IRR 直接外推。")
 st.divider()
 
 if view_mode == "圖表":
@@ -985,7 +988,7 @@ if view_mode == "圖表":
     default_monthly = 0
     monthly_add = st.number_input("每月新增投入金額（可自行調整）", min_value=0, value=default_monthly, step=1000)
 
-    with st.expander("進階預測參數", expanded=False):
+    with st.expander("進階預測參數（可調整預測基準）", expanded=False):
         projection_convergence = st.slider(
             "有效報酬收斂係數",
             min_value=0.20,
