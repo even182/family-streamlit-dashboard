@@ -2,4 +2,6 @@ streamlit
 yfinance
 plotly
 pandas
+numpy
 streamlit-autorefresh
+openpyxl
