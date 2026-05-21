@@ -554,16 +554,17 @@ def compute_advanced_metrics(richard: pd.DataFrame, acct: pd.DataFrame):
         "simple_ret": simple_ret,
     }
 
-def make_10y_projection_chart(
+def make_projection_chart(
     start_assets: float,
     effective_rate: float | None,
     annual_add: float = 0.0,
     convergence: float = 0.50,
     min_rate: float = 0.03,
     max_rate: float = 0.15,
+    years: int = 10,
 ):
     """
-    進階版 10年資產預測：
+    進階版長期資產預測：
     - 來源：有效年化報酬率 = IRR × 資金使用率 + 現金報酬 × 現金比例。
     - 長期預測基準：有效報酬 × 收斂係數，再套用上下限，避免短期 IRR 過度外推。
     - 三情境：保守 / 基準 / 樂觀，皆由動態基準推導，不再是固定寫死。
@@ -586,7 +587,7 @@ def make_10y_projection_chart(
     rows = []
     for name, r in scenarios.items():
         value = start_assets
-        for y in range(0, 11):
+        for y in range(0, years + 1):
             if y == 0:
                 value = start_assets
             else:
@@ -599,7 +600,7 @@ def make_10y_projection_chart(
         y="預測資產",
         color="情境",
         markers=True,
-        title="10年資產預測（有效報酬動態基準 + 長期收斂）",
+        title=f"{years}年資產預測（有效報酬動態基準 + 長期收斂）",
     )
     fig.update_layout(height=520, yaxis_title="資產金額", legend_title_text="")
     fig.update_yaxes(tickformat=",")
@@ -1030,9 +1031,11 @@ if view_mode == "圖表":
     else:
         st.info("無法產生『投資收益（年度 vs 累積）』圖表（請確認 Excel 有『賣出日期 / 已實現損益』）。")
 
-    st.subheader("10年資產預測")
+    st.subheader("資產預測")
     default_monthly = 0
     monthly_add = st.number_input("每月新增投入金額（可自行調整）", min_value=0, value=default_monthly, step=1000)
+
+    projection_years = st.radio("預測年數", [10, 20, 30, 40], horizontal=True, index=0)
 
     with st.expander("進階預測參數（可調整預測基準）", expanded=False):
         projection_convergence = st.slider(
@@ -1049,7 +1052,7 @@ if view_mode == "圖表":
             max_value=25.0,
             value=float(adv["projection_max_rate"] * 100),
             step=0.5,
-            help="避免短期高 IRR 讓 10 年預測過度膨脹。",
+            help="避免短期高 IRR 讓長期預測過度膨脹。",
         )
         min_projection_rate_pct = st.slider(
             "預測報酬率下限",
@@ -1067,18 +1070,19 @@ if view_mode == "圖表":
             f"套用上下限後基準：{preview_base*100:.2f}%"
         )
 
-    proj_fig = make_10y_projection_chart(
+    proj_fig = make_projection_chart(
         adv["total_assets"],
         adv["effective_return_rate"],
         annual_add=monthly_add * 12,
         convergence=projection_convergence,
         min_rate=min_projection_rate_pct / 100,
         max_rate=max_projection_rate_pct / 100,
+        years=projection_years,
     )
     if proj_fig is not None:
         st.plotly_chart(proj_fig, use_container_width=True)
     else:
-        st.info("總資產資料不足，無法產生 10 年資產預測。")
+        st.info("總資產資料不足，無法產生資產預測。")
 
     pie = make_allocation_pie_from_analysis(XLSX_PATH)
     if pie is not None:
