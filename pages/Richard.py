@@ -558,6 +558,235 @@ def make_holding_distribution_pie(richard: pd.DataFrame, market: str | None = No
     fig.update_layout(height=520)
     return fig
 
+
+def _clean_stock_code_for_display(x) -> str:
+    """
+    將 Excel 讀進來的股票代號清成一致格式：
+    - 2330.0 -> 2330
+    - 2330 -> 2330
+    - QQQ -> QQQ
+    目的：避免同一檔股票因代號格式不同而被拆成兩筆。
+    """
+    s = _clean_text(x)
+    if not s or s.lower() == "nan":
+        return ""
+    if re.fullmatch(r"\d+\.0+", s):
+        return s.split(".")[0]
+    return s
+
+def build_holding_analysis_table(richard: pd.DataFrame, market: str | None = None):
+    """
+    建立目前持股的共同分析資料：
+    - 只計入參考現值 > 0 的目前持股
+    - 同一股票多筆買進自動合併
+    - 持股投報率優先使用 Excel「投資報酬率」欄位，依成交金額加權
+    - 對總資產貢獻 = 持股比重 × 持股投報率
+    """
+    required_cols = ["成交金額", "參考現值"]
+    if any(c not in richard.columns for c in required_cols):
+        return None
+
+    code_col = "股票代號" if "股票代號" in richard.columns else None
+    name_col = "股票名稱" if "股票名稱" in richard.columns else ("股票" if "股票" in richard.columns else None)
+    cat_col = "分類" if "分類" in richard.columns else None
+    if name_col is None:
+        return None
+
+    df = _filter_trade_like_rows(richard).copy()
+
+    if market is not None:
+        if cat_col is None:
+            return None
+        cat = df[cat_col].astype(str).str.strip()
+        if market == "台股":
+            df = df[cat.isin(["台股", "台股 ETF"])]
+        elif market == "美股":
+            df = df[cat == "美股"]
+        else:
+            return None
+
+    numeric_cols = ["股數", "成交金額", "參考現值", "未實現損益", "除息", "投資報酬率"]
+    for c in numeric_cols:
+        if c in df.columns:
+            df[c] = to_num(df[c])
+        else:
+            df[c] = 0.0
+
+    df = df[df["參考現值"] > 0].copy()
+    if df.empty:
+        return None
+
+    df[name_col] = df[name_col].astype(str).str.strip()
+    df = df[(df[name_col] != "") & (df[name_col].str.lower() != "nan")].copy()
+    if df.empty:
+        return None
+
+    if code_col is not None:
+        df[code_col] = df[code_col].apply(_clean_stock_code_for_display)
+        df["標的"] = np.where(
+            (df[code_col] != "") & (df[code_col].str.lower() != "nan"),
+            df[code_col] + " " + df[name_col],
+            df[name_col],
+        )
+    else:
+        df["標的"] = df[name_col]
+
+    df["分類顯示"] = df[cat_col].astype(str).str.strip() if cat_col else ""
+    df["投報率加權值"] = df["投資報酬率"] * df["成交金額"]
+
+    # 同一檔股票只依「標的」合併，避免同股票因分類或格式差異被拆成多筆投報率。
+    agg = (
+        df.groupby("標的", dropna=False)
+          .agg(
+              分類=("分類顯示", lambda s: " / ".join(sorted(set([x for x in s.astype(str).str.strip() if x and x.lower() != "nan"])))),
+              股數=("股數", "sum"),
+              投入成本=("成交金額", "sum"),
+              參考現值=("參考現值", "sum"),
+              未實現損益=("未實現損益", "sum"),
+              除息=("除息", "sum"),
+              投報率加權值=("投報率加權值", "sum"),
+          )
+          .reset_index()
+    )
+    agg = agg[agg["投入成本"] > 0].copy()
+    if agg.empty:
+        return None
+
+    fallback_return = (agg["未實現損益"] + agg["除息"]) / agg["投入成本"]
+    weighted_return = agg["投報率加權值"] / agg["投入成本"]
+    agg["持股投報率"] = np.where(np.isfinite(weighted_return), weighted_return, fallback_return)
+    agg["持股損益"] = agg["持股投報率"] * agg["投入成本"]
+    agg["持股比重"] = agg["參考現值"] / agg["參考現值"].sum()
+    agg["對總資產貢獻"] = agg["持股比重"] * agg["持股投報率"]
+    agg["損益狀態"] = np.where(agg["持股投報率"] >= 0, "獲利", "虧損")
+    return agg.sort_values("對總資產貢獻", ascending=False)
+
+
+def select_holding_analysis_market(key: str):
+    market_label = st.radio(
+        "分析篩選",
+        ["台股（含台股 ETF）", "美股", "全部"],
+        horizontal=True,
+        key=key,
+    )
+    if market_label.startswith("台股"):
+        return "台股"
+    if market_label == "美股":
+        return "美股"
+    return None
+
+
+def render_holding_analysis_summary(table: pd.DataFrame):
+    total_cost = float(table["投入成本"].sum())
+    total_value = float(table["參考現值"].sum())
+    total_pnl = float(table["持股損益"].sum())
+    total_return = total_pnl / total_cost if total_cost > 0 else 0.0
+    top_contributor = table.sort_values("對總資產貢獻", ascending=False).iloc[0]
+    largest_weight = table.sort_values("持股比重", ascending=False).iloc[0]
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("目前持股成本", f"{total_cost:,.0f}")
+    m2.metric("目前持股現值", f"{total_value:,.0f}")
+    m3.metric("目前持股損益", f"{total_pnl:,.0f}", f"{total_return*100:.2f}%")
+    m4.metric("最大影響 / 最大部位", f"{top_contributor['標的']}", f"最大部位：{largest_weight['標的']}")
+
+
+def render_holding_analysis_table(table: pd.DataFrame, height: int = 360):
+    table_view = table[[
+        "標的", "分類", "股數", "投入成本", "參考現值", "持股比重",
+        "持股投報率", "對總資產貢獻", "持股損益", "未實現損益", "除息"
+    ]].copy()
+
+    st.dataframe(
+        table_view.style.format({
+            "股數": "{:,.0f}",
+            "投入成本": "{:,.0f}",
+            "參考現值": "{:,.0f}",
+            "持股比重": "{:.2%}",
+            "持股投報率": "{:.2%}",
+            "對總資產貢獻": "{:.2%}",
+            "持股損益": "{:,.0f}",
+            "未實現損益": "{:,.0f}",
+            "除息": "{:,.0f}",
+        }),
+        use_container_width=True,
+        height=height,
+    )
+
+
+
+def render_full_holding_analysis(richard: pd.DataFrame):
+    st.subheader("持股健康度完整分析")
+    market = select_holding_analysis_market("full_holding_market")
+    table = build_holding_analysis_table(richard, market=market)
+    if table is None or table.empty:
+        st.info("沒有可用的目前持股分析資料。")
+        return
+
+    render_holding_analysis_summary(table)
+
+    st.markdown("#### 1. 持股比重 × 投報率 Bubble Chart")
+    size_mode = st.radio("氣泡大小", ["參考現值", "投入成本"], horizontal=True, key="full_bubble_size_mode")
+    bubble_fig = px.scatter(
+        table,
+        x="持股比重",
+        y="持股投報率",
+        size=size_mode,
+        color="損益狀態",
+        color_discrete_map={"獲利": "#1f77b4", "虧損": "#ff99c8"},
+        text="標的",
+        hover_data={
+            "標的": True,
+            "分類": True,
+            "投入成本": ":,.0f",
+            "參考現值": ":,.0f",
+            "持股比重": ":.2%",
+            "持股投報率": ":.2%",
+            "對總資產貢獻": ":.2%",
+            "持股損益": ":,.0f",
+            "損益狀態": False,
+        },
+        title="持股比重 × 投報率（看資金大小與報酬效率）",
+    )
+    bubble_fig.update_traces(textposition="top center")
+    bubble_fig.update_layout(height=560, legend_title_text="")
+    bubble_fig.update_xaxes(title="持股比重", tickformat=".0%", zeroline=True, zerolinewidth=1, zerolinecolor="gray")
+    bubble_fig.update_yaxes(title="持股投報率", tickformat=".0%", zeroline=True, zerolinewidth=1, zerolinecolor="gray")
+    st.plotly_chart(bubble_fig, use_container_width=True)
+
+    st.markdown("#### 2. 對總資產貢獻排行")
+    df = table.sort_values("對總資產貢獻", ascending=True)
+    bar_colors = np.where(df["對總資產貢獻"] >= 0, "#1f77b4", "#ff99c8")
+    contribution_fig = go.Figure()
+    contribution_fig.add_bar(
+        x=df["對總資產貢獻"],
+        y=df["標的"],
+        orientation="h",
+        marker_color=bar_colors,
+        text=df["對總資產貢獻"].map(lambda v: f"{v*100:.2f}%"),
+        textposition="outside",
+    )
+    contribution_fig.update_layout(
+        title="真正拉動或拖累整體績效的持股",
+        height=max(420, min(700, 120 + len(df) * 38)),
+        showlegend=False,
+        margin=dict(t=70, r=90),
+        xaxis_title="對總資產貢獻",
+        yaxis_title="",
+    )
+    contribution_fig.update_xaxes(tickformat=".0%", zeroline=True, zerolinewidth=1, zerolinecolor="gray")
+    st.plotly_chart(contribution_fig, use_container_width=True)
+
+    st.markdown("#### 3. 資金效率排行榜")
+    sort_option = st.radio(
+        "表格排序",
+        ["對總資產貢獻", "持股投報率", "持股比重", "參考現值", "持股損益"],
+        horizontal=True,
+        key="full_sort_option",
+    )
+    render_holding_analysis_table(table.sort_values(sort_option, ascending=False), height=520)
+
+
 def _filter_trade_like_rows(df: pd.DataFrame) -> pd.DataFrame:
     """
     避免把 Excel 底部『分析/總計』等彙總區塊算進交易/持股。
@@ -1061,6 +1290,8 @@ if view_mode == "圖表":
             st.plotly_chart(holding_pie_us, use_container_width=True)
         else:
             st.info("沒有找到可用的美股『參考現值』持股資料。")
+
+    render_full_holding_analysis(richard)
 
     ts = make_timeseries(acct)
     if ts is not None:
