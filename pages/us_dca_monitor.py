@@ -2063,12 +2063,316 @@ def show_stock_dca_section():
                 )
 
 
+
+# =========================
+# Brokerage Lump-Sum Monitor
+# =========================
+
+BROKERAGE_ETF_LIST = {
+    "QQQ": "QQQ",
+    "VT": "VT",
+}
+
+
+@st.cache_data(ttl=300)
+def get_brokerage_etf_data(symbol, period="18mo"):
+
+    ticker = yf.Ticker(symbol)
+    hist = ticker.history(period=period, interval="1d")
+
+    if hist.empty:
+        return None
+
+    hist = hist.dropna(subset=["Close"]).copy()
+
+    if len(hist) < 220:
+        return None
+
+    latest_date = hist.index[-1]
+    latest_price = float(hist["Close"].iloc[-1])
+
+    # 約一個月前最近交易日，與上方 DCA 區塊維持一致。
+    target_date = latest_date - pd.Timedelta(days=30)
+    previous_hist = hist[hist.index <= target_date]
+
+    if previous_hist.empty:
+        previous_price = float(hist["Close"].iloc[0])
+        previous_date = hist.index[0]
+    else:
+        previous_price = float(previous_hist["Close"].iloc[-1])
+        previous_date = previous_hist.index[-1]
+
+    month_change = latest_price - previous_price
+    month_change_pct = month_change / previous_price * 100
+
+    ma200 = float(hist["Close"].rolling(200).mean().iloc[-1])
+    distance_200ma_pct = (latest_price / ma200 - 1) * 100
+
+    delta = hist["Close"].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / loss.replace(0, float("nan"))
+    rsi = 100 - (100 / (1 + rs))
+    latest_rsi = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else 50.0
+
+    return {
+        "symbol": symbol,
+        "price": latest_price,
+        "previous_price": previous_price,
+        "previous_date": previous_date,
+        "month_change": month_change,
+        "month_change_pct": month_change_pct,
+        "ma200": ma200,
+        "distance_200ma_pct": distance_200ma_pct,
+        "rsi": latest_rsi,
+        "hist": hist.tail(130),
+        "last_time": latest_date,
+    }
+
+
+def calc_brokerage_score(data, vix_value=None, fear_greed_value=None):
+    """滿分 100；前 80 分為標的價格面，後 20 分為共通市場情緒。"""
+
+    # 1) 一個月相對跌幅：跌 15% 以上得滿分；上漲不加分。
+    decline = max(0.0, -data["month_change_pct"])
+    decline_score = min(35.0, decline / 15.0 * 35.0)
+
+    # 2) 距離 200MA：低於年線越多，分數越高；高於 15% 幾乎不加分。
+    distance = data["distance_200ma_pct"]
+    if distance <= -10:
+        ma_score = 25.0
+    elif distance <= 0:
+        ma_score = 15.0 + (-distance / 10.0) * 10.0
+    elif distance <= 15:
+        ma_score = max(0.0, 15.0 - distance)
+    else:
+        ma_score = 0.0
+
+    # 3) RSI：偏低代表短期較不熱；RSI 30 以下滿分，70 以上零分。
+    rsi = data["rsi"]
+    if rsi <= 30:
+        rsi_score = 20.0
+    elif rsi >= 70:
+        rsi_score = 0.0
+    else:
+        rsi_score = (70.0 - rsi) / 40.0 * 20.0
+
+    # 4) VIX：市場越恐慌，整體加碼環境分數越高。
+    if vix_value is None:
+        vix_score = 5.0
+    elif vix_value >= 30:
+        vix_score = 10.0
+    elif vix_value <= 15:
+        vix_score = 2.0
+    else:
+        vix_score = 2.0 + (vix_value - 15.0) / 15.0 * 8.0
+
+    # 5) Fear & Greed：越恐懼，分數越高。
+    if fear_greed_value is None:
+        fg_score = 5.0
+    else:
+        fg_score = max(0.0, min(10.0, (100.0 - fear_greed_value) / 10.0))
+
+    total = decline_score + ma_score + rsi_score + vix_score + fg_score
+
+    return {
+        "跌幅分數": decline_score,
+        "200MA分數": ma_score,
+        "RSI分數": rsi_score,
+        "VIX分數": vix_score,
+        "情緒分數": fg_score,
+        "總分": min(100.0, total),
+    }
+
+
+def show_brokerage_monitor_section():
+
+    st.divider()
+
+    st.markdown(
+        section_title_html(
+            "🎯 複委託單筆投入監控",
+            "每月比較 QQQ 與 VT 的一個月漲跌、距離 200 日均線、RSI，以及市場情緒，選出本月較適合投入的 ETF，並依最低一股限制估算可買股數。",
+            font_size=20
+        ),
+        unsafe_allow_html=True
+    )
+
+    setting_col1, setting_col2 = st.columns([1, 1])
+
+    with setting_col1:
+        monthly_budget = st.number_input(
+            "本月複委託投入預算（USD）",
+            min_value=0,
+            value=1250,
+            step=50,
+            key="brokerage_monthly_budget",
+            help="依目前規劃預設為 1,250 美元，可在每月評估時調整。"
+        )
+
+    with setting_col2:
+        st.metric(
+            "評估方式",
+            "QQQ vs VT",
+            delta="最低買進 1 股",
+            delta_color="off"
+        )
+
+    etf_data = {
+        name: get_brokerage_etf_data(symbol)
+        for name, symbol in BROKERAGE_ETF_LIST.items()
+    }
+
+    valid_data = {k: v for k, v in etf_data.items() if v is not None}
+
+    if len(valid_data) < 2:
+        st.warning("QQQ 或 VT 資料不足，目前無法完成複委託比較，請稍後刷新。")
+        return
+
+    vix_data = get_vix_data("1mo")
+    fear_greed_data = get_fear_greed_data()
+
+    vix_value = vix_data.get("price") if vix_data else None
+    fear_greed_value = fear_greed_data.get("score") if fear_greed_data else None
+
+    score_data = {
+        symbol: calc_brokerage_score(
+            data,
+            vix_value=vix_value,
+            fear_greed_value=fear_greed_value
+        )
+        for symbol, data in valid_data.items()
+    }
+
+    # 若總分相同，優先選一個月表現較弱者。
+    pick_symbol = max(
+        valid_data.keys(),
+        key=lambda symbol: (
+            score_data[symbol]["總分"],
+            -valid_data[symbol]["month_change_pct"]
+        )
+    )
+
+    pick_data = valid_data[pick_symbol]
+    shares = int(monthly_budget // pick_data["price"]) if monthly_budget > 0 else 0
+    estimated_amount = shares * pick_data["price"]
+    remaining_cash = monthly_budget - estimated_amount
+
+    if shares >= 1:
+        st.success(
+            f"本月複委託建議：{pick_symbol}｜AI 評分 {score_data[pick_symbol]['總分']:.1f}｜"
+            f"預算 ${monthly_budget:,.0f} 可買 {shares} 股，預估投入 ${estimated_amount:,.2f}。"
+        )
+    else:
+        st.warning(
+            f"本月評分較高的是 {pick_symbol}，但預算 ${monthly_budget:,.0f} 不足買進 1 股；"
+            f"目前至少需要約 ${pick_data['price']:,.2f}。"
+        )
+
+    card_cols = st.columns(2)
+
+    for col, symbol in zip(card_cols, ["QQQ", "VT"]):
+        data = valid_data[symbol]
+        scores = score_data[symbol]
+        is_pick = symbol == pick_symbol
+        symbol_shares = int(monthly_budget // data["price"]) if monthly_budget > 0 else 0
+        symbol_amount = symbol_shares * data["price"]
+        symbol_cash = monthly_budget - symbol_amount
+
+        with col:
+            with st.container(border=True):
+                badge = (
+                    "<span style='background:#2563eb;color:white;border-radius:999px;"
+                    "padding:3px 9px;font-size:12px;font-weight:700;margin-left:6px;'>"
+                    "本月建議</span>"
+                    if is_pick else ""
+                )
+
+                st.markdown(
+                    f"<div style='font-size:18px;font-weight:800;'>📌 {symbol}{badge}</div>",
+                    unsafe_allow_html=True
+                )
+
+                m1, m2 = st.columns(2)
+                m1.metric("現價", f"${data['price']:,.2f}")
+                m2.metric("AI 評分", f"{scores['總分']:.1f}")
+
+                st.markdown(
+                    f"上次參考（{format_date(data['previous_date'])}）："
+                    f"**${data['previous_price']:,.2f}**  \n"
+                    f"一個月比較：**{data['month_change_pct']:+.2f}%**  \n"
+                    f"200 日均線：**${data['ma200']:,.2f}**（距離 {data['distance_200ma_pct']:+.2f}%）  \n"
+                    f"RSI(14)：**{data['rsi']:.1f}**"
+                )
+
+                fig = draw_stock_dca_chart(
+                    data["hist"],
+                    positive=data["month_change_pct"] >= 0
+                )
+                if fig is not None:
+                    st.plotly_chart(
+                        fig,
+                        use_container_width=True,
+                        config={"displayModeBar": False},
+                        key=f"brokerage_chart_{symbol}"
+                    )
+
+                if symbol_shares >= 1:
+                    st.info(
+                        f"預算 ${monthly_budget:,.0f}：可買 **{symbol_shares} 股**｜"
+                        f"預估 ${symbol_amount:,.2f}｜剩餘 ${symbol_cash:,.2f}"
+                    )
+                else:
+                    st.info(
+                        f"預算 ${monthly_budget:,.0f}：不足買進 1 股，尚差約 "
+                        f"${data['price'] - monthly_budget:,.2f}"
+                    )
+
+    score_rows = []
+    for symbol in ["QQQ", "VT"]:
+        scores = score_data[symbol]
+        score_rows.append({
+            "ETF": symbol,
+            "一個月漲跌": f"{valid_data[symbol]['month_change_pct']:+.2f}%",
+            "距200MA": f"{valid_data[symbol]['distance_200ma_pct']:+.2f}%",
+            "RSI(14)": f"{valid_data[symbol]['rsi']:.1f}",
+            "價格面分數": f"{scores['跌幅分數'] + scores['200MA分數'] + scores['RSI分數']:.1f}",
+            "市場情緒分數": f"{scores['VIX分數'] + scores['情緒分數']:.1f}",
+            "AI總分": f"{scores['總分']:.1f}",
+            "本月建議": "✅" if symbol == pick_symbol else "",
+        })
+
+    st.dataframe(
+        pd.DataFrame(score_rows),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    context_cols = st.columns(3)
+    context_cols[0].metric(
+        "VIX",
+        f"{vix_value:.2f}" if vix_value is not None else "--"
+    )
+    context_cols[1].metric(
+        "Fear & Greed",
+        f"{fear_greed_value:.0f}" if fear_greed_value is not None else "--"
+    )
+    context_cols[2].metric(
+        "預算剩餘",
+        f"${remaining_cash:,.2f}" if shares >= 1 else f"${monthly_budget:,.2f}"
+    )
+
+    st.caption(
+        "評分用途是協助每月在 QQQ 與 VT 之間作相對比較，不代表預測最低點。"
+        "若兩檔總分接近，仍可依長期目標配置比例決定。"
+    )
+
 # =========================
 # Header
 # =========================
 
 st.title("美股定期定額監控")
-st.caption("美股定期定額｜匯率走勢｜市場情緒")
+st.caption("AI 定期定額監控｜複委託單筆投入｜匯率走勢｜市場情緒")
 
 col_time, col_btn = st.columns([5, 1])
 
@@ -2086,48 +2390,21 @@ st.divider()
 
 
 # =========================
-# US Stock DCA Monitor
+# 1. AI Stock DCA Monitor
 # =========================
 
 show_stock_dca_section()
 
 
 # =========================
-# Market Sentiment
+# 2. Brokerage Lump-Sum Monitor
 # =========================
 
-st.divider()
-
-sentiment_title_col, vix_period_col = st.columns([3, 2])
-
-with sentiment_title_col:
-
-    st.markdown(
-        section_title_html(
-            "市場情緒",
-            "整合 CNN 恐懼與貪婪指數與 VIX 恐慌指數，觀察市場風險偏好與避險情緒。",
-            font_size=20
-        ),
-        unsafe_allow_html=True
-    )
-
-
-sentiment_col1, sentiment_col2 = st.columns([1, 1])
-
-with sentiment_col1:
-
-    show_fear_greed_card()
-
-with sentiment_col2:
-
-    show_vix_card(
-        period="1d",
-        selected_label="1天"
-    )
+show_brokerage_monitor_section()
 
 
 # =========================
-# Currency Trend
+# 3. Currency Trend
 # =========================
 
 st.divider()
@@ -2160,36 +2437,21 @@ currency_period = PERIOD_OPTIONS[selected_period_label]
 
 fx_col1, fx_col2, fx_col3 = st.columns(3)
 
-# =========================
-# 美元指數 DXY
-# =========================
-
 with fx_col1:
-
     show_currency_chart_card(
         "美元指數 DXY",
         "DX-Y.NYB",
         period=currency_period
     )
 
-# =========================
-# USD/TWD
-# =========================
-
 with fx_col2:
-
     show_currency_chart_card(
         "USD/TWD 台幣匯率",
         "TWD=X",
         period=currency_period
     )
 
-# =========================
-# USD/JPY
-# =========================
-
 with fx_col3:
-
     show_currency_chart_card(
         "USD/JPY 日幣匯率",
         "JPY=X",
@@ -2197,3 +2459,32 @@ with fx_col3:
     )
 
 
+# =========================
+# 4. Market Sentiment
+# =========================
+
+st.divider()
+
+sentiment_title_col, vix_period_col = st.columns([3, 2])
+
+with sentiment_title_col:
+
+    st.markdown(
+        section_title_html(
+            "市場情緒",
+            "整合 CNN 恐懼與貪婪指數與 VIX 恐慌指數，觀察市場風險偏好與避險情緒。",
+            font_size=20
+        ),
+        unsafe_allow_html=True
+    )
+
+sentiment_col1, sentiment_col2 = st.columns([1, 1])
+
+with sentiment_col1:
+    show_fear_greed_card()
+
+with sentiment_col2:
+    show_vix_card(
+        period="1d",
+        selected_label="1天"
+    )
