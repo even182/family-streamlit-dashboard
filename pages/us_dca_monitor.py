@@ -2070,8 +2070,57 @@ def show_stock_dca_section():
 
 BROKERAGE_ETF_LIST = {
     "QQQ": "QQQ",
-    "VT": "VT",
+    "VWRA": "VWRA.L",
 }
+
+
+# Existing holdings from the 2026-08-24 initial purchase
+INITIAL_QQQ_SHARES = 16
+INITIAL_VT_SHARES = 48
+TARGET_QQQ_WEIGHT = 0.60
+TARGET_GLOBAL_WEIGHT = 0.40
+
+
+@st.cache_data(ttl=300)
+def get_existing_holdings_snapshot():
+    try:
+        qqq_hist = yf.Ticker("QQQ").history(period="10d", interval="1d")
+        vt_hist = yf.Ticker("VT").history(period="10d", interval="1d")
+        if qqq_hist.empty or vt_hist.empty:
+            return None
+
+        qqq_price = float(qqq_hist["Close"].dropna().iloc[-1])
+        vt_price = float(vt_hist["Close"].dropna().iloc[-1])
+        qqq_value = INITIAL_QQQ_SHARES * qqq_price
+        global_value = INITIAL_VT_SHARES * vt_price
+        total = qqq_value + global_value
+        if total <= 0:
+            return None
+
+        return {
+            "qqq_price": qqq_price,
+            "vt_price": vt_price,
+            "qqq_value": qqq_value,
+            "global_value": global_value,
+            "total_value": total,
+            "qqq_weight": qqq_value / total,
+            "global_weight": global_value / total,
+        }
+    except Exception:
+        return None
+
+
+def calc_allocation_bonus(symbol, snapshot):
+    """Max 20 points. Underweight side gets a positive allocation bonus."""
+    if snapshot is None:
+        return 0.0
+
+    if symbol == "QQQ":
+        gap = TARGET_QQQ_WEIGHT - snapshot["qqq_weight"]
+    else:
+        gap = TARGET_GLOBAL_WEIGHT - snapshot["global_weight"]
+
+    return max(0.0, min(20.0, gap * 200.0))
 
 
 @st.cache_data(ttl=300)
@@ -2192,7 +2241,7 @@ def show_brokerage_monitor_section():
     st.markdown(
         section_title_html(
             "🎯 複委託單筆投入監控",
-            "每月比較 QQQ 與 VT 的一個月漲跌、距離 200 日均線、RSI，以及市場情緒，選出本月較適合投入的 ETF，並依最低一股限制估算可買股數。",
+            "每月比較 QQQ 與 VWRA 的一個月漲跌、距離 200 日均線、RSI、市場情緒與 60/40 配置偏離，選出本月較適合投入的 ETF，並依最低一股限制估算可買股數。",
             font_size=20
         ),
         unsafe_allow_html=True
@@ -2213,10 +2262,15 @@ def show_brokerage_monitor_section():
     with setting_col2:
         st.metric(
             "評估方式",
-            "QQQ vs VT",
+            "QQQ vs VWRA",
             delta="最低買進 1 股",
             delta_color="off"
         )
+
+    st.caption(
+        "既有部位：2026/08/24 買入 QQQ 16 股 + VT 48 股；既有 VT 保留，"
+        "未來全球核心新增資金改買 VWRA。目標配置：QQQ 60% / 全球核心 40%。"
+    )
 
     etf_data = {
         name: get_brokerage_etf_data(symbol)
@@ -2226,7 +2280,7 @@ def show_brokerage_monitor_section():
     valid_data = {k: v for k, v in etf_data.items() if v is not None}
 
     if len(valid_data) < 2:
-        st.warning("QQQ 或 VT 資料不足，目前無法完成複委託比較，請稍後刷新。")
+        st.warning("QQQ 或 VWRA 資料不足，目前無法完成複委託比較，請稍後刷新。")
         return
 
     vix_data = get_vix_data("1mo")
@@ -2243,6 +2297,16 @@ def show_brokerage_monitor_section():
         )
         for symbol, data in valid_data.items()
     }
+
+    # Existing VT remains part of the global-core bucket; future additions use VWRA.
+    holdings_snapshot = get_existing_holdings_snapshot()
+    for symbol in score_data:
+        raw_score = score_data[symbol]["總分"]
+        technical_80 = raw_score * 0.80
+        allocation_bonus = calc_allocation_bonus(symbol, holdings_snapshot)
+        score_data[symbol]["技術分數80"] = technical_80
+        score_data[symbol]["配置加分"] = allocation_bonus
+        score_data[symbol]["總分"] = min(100.0, technical_80 + allocation_bonus)
 
     # 若總分相同，優先選一個月表現較弱者。
     pick_symbol = max(
@@ -2269,9 +2333,25 @@ def show_brokerage_monitor_section():
             f"目前至少需要約 ${pick_data['price']:,.2f}。"
         )
 
+    if holdings_snapshot is not None:
+        st.markdown("#### 📊 目前既有持倉配置")
+        h1, h2, h3 = st.columns(3)
+        h1.metric(
+            "QQQ",
+            f"{holdings_snapshot['qqq_weight'] * 100:.1f}%",
+            f"目標 60%｜{INITIAL_QQQ_SHARES} 股"
+        )
+        h2.metric(
+            "全球核心（VT）",
+            f"{holdings_snapshot['global_weight'] * 100:.1f}%",
+            f"目標 40%｜{INITIAL_VT_SHARES} 股"
+        )
+        qqq_gap_pp = (holdings_snapshot['qqq_weight'] - TARGET_QQQ_WEIGHT) * 100
+        h3.metric("QQQ 配置偏離", f"{qqq_gap_pp:+.1f} 個百分點")
+
     card_cols = st.columns(2)
 
-    for col, symbol in zip(card_cols, ["QQQ", "VT"]):
+    for col, symbol in zip(card_cols, ["QQQ", "VWRA"]):
         data = valid_data[symbol]
         scores = score_data[symbol]
         is_pick = symbol == pick_symbol
@@ -2329,15 +2409,15 @@ def show_brokerage_monitor_section():
                     )
 
     score_rows = []
-    for symbol in ["QQQ", "VT"]:
+    for symbol in ["QQQ", "VWRA"]:
         scores = score_data[symbol]
         score_rows.append({
             "ETF": symbol,
             "一個月漲跌": f"{valid_data[symbol]['month_change_pct']:+.2f}%",
             "距200MA": f"{valid_data[symbol]['distance_200ma_pct']:+.2f}%",
             "RSI(14)": f"{valid_data[symbol]['rsi']:.1f}",
-            "價格面分數": f"{scores['跌幅分數'] + scores['200MA分數'] + scores['RSI分數']:.1f}",
-            "市場情緒分數": f"{scores['VIX分數'] + scores['情緒分數']:.1f}",
+            "技術/情緒分數(80)": f"{scores.get('技術分數80', 0):.1f}",
+            "配置加分(20)": f"{scores.get('配置加分', 0):.1f}",
             "AI總分": f"{scores['總分']:.1f}",
             "本月建議": "✅" if symbol == pick_symbol else "",
         })
@@ -2363,8 +2443,8 @@ def show_brokerage_monitor_section():
     )
 
     st.caption(
-        "評分用途是協助每月在 QQQ 與 VT 之間作相對比較，不代表預測最低點。"
-        "若兩檔總分接近，仍可依長期目標配置比例決定。"
+        "評分用途是協助每月在 QQQ 與 VWRA 之間作相對比較，不代表預測最低點。"
+        "既有 VT 會計入全球核心 40% 的配置；未來新增全球核心以 VWRA 為主。"
     )
 
 # =========================
